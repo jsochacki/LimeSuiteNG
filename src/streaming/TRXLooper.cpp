@@ -151,7 +151,9 @@ bool deinterleave_alignment_packet(const StreamConfig& config,
 
     const uint16_t payload_size_bytes = packet.GetPayloadSize() == 0 ? sizeof(packet.data) : packet.GetPayloadSize();
     const int samples_deinterleaved = Deinterleave(destinations, packet.data, payload_size_bytes, conversion);
-    if (samples_deinterleaved < 512)
+    //512 sized packet but header is 16 bits so only 510 samples
+    // TODO maybe just make 510
+    if (samples_deinterleaved < 256)
         return false;
 
     channel_a_samples->resize(samples_deinterleaved);
@@ -196,12 +198,13 @@ static OpStatus WriteAlignmentRegistersToBothChannels(
 static double
 compute_single_bin_power(const std::vector<complex16_t>& samples,
                          int                             bin,
+                         int                             sample_count,
                          int                             dft_length)
 {
    const std::complex<double> imaginary_unit(0.0, 1.0);
    const double               pi = std::acos(-1.0);
    std::complex<double>       spectrum(0.0, 0.0);
-   for(int sample_index = 0; sample_index < dft_length; ++sample_index)
+   for(int sample_index = 0; sample_index < sample_count; ++sample_index)
    {
       const std::complex<double> sample_value(
          static_cast<double>(samples[sample_index].real()),
@@ -658,7 +661,7 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
         }
     }
 
-    std::fprintf(stderr, "align: tsp search start");
+    std::fprintf(stderr, "align: tsp search start\n");
     std::fflush(stderr);
 
     bool aligned = false;
@@ -685,7 +688,7 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
 
         if (CheckTSPAligned(packet, checkpoint_pairs))
         {
-            std::fprintf(stderr, "align: tsp aligned on iteration %u", iteration);
+            std::fprintf(stderr, "align: tsp aligned on iteration %u\n", iteration);
             std::fflush(stderr);
             aligned = true;
             break;
@@ -763,12 +766,13 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
         return 0.0;
 
     static constexpr int dft_length = 512;
+    const int sample_count = std::min<int>(512, static_cast<int>(channel_a_samples.size()));
     const complex64f_t imaginary_unit(0.0, 1.0);
     const double pi = std::acos(-1.0);
 
     complex64f_t spectrum_a(0.0, 0.0);
     complex64f_t spectrum_b(0.0, 0.0);
-    for (int sample_index = 0; sample_index < dft_length; ++sample_index)
+    for (int sample_index = 0; sample_index < sample_count; ++sample_index)
     {
         const complex64f_t sample_a(channel_a_samples[sample_index].real(), channel_a_samples[sample_index].imag());
         const complex64f_t sample_b(channel_b_samples[sample_index].real(), channel_b_samples[sample_index].imag());
@@ -780,15 +784,15 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
     }
 
    const double power_a
-      = compute_single_bin_power(channel_a_samples, bin, dft_length);
+      = compute_single_bin_power(channel_a_samples, bin, sample_count, dft_length);
    const double power_b
-      = compute_single_bin_power(channel_b_samples, bin, dft_length);
+      = compute_single_bin_power(channel_b_samples, bin, sample_count, dft_length);
    double phase_degrees
       = std::arg(spectrum_b) * 180.0 / pi - std::arg(spectrum_a) * 180.0 / pi;
    while(phase_degrees < -180.0) phase_degrees += 360.0;
    while(phase_degrees > 180.0) phase_degrees -= 360.0;
    std::fprintf(stderr, "align: bin=%d phase_deg=%+.6f power_a=%.3e power_b=%.3e "
-               "payload_bytes=%u samples=%zu",
+               "payload_bytes=%u samples=%zu\n",
                bin,
                phase_degrees,
                power_a,
@@ -815,7 +819,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
     const double slope_tolerance_deg_per_bin = legacy_tolerances[decimation_index] / 32.0;
     const double residual_rms_tolerance_deg = std::max(2.0, legacy_tolerances[decimation_index] * 8.0);
 
-    std::fprintf(stderr, "align: slope search start");
+    std::fprintf(stderr, "align: slope search start\n");
     std::fflush(stderr);
 
     for (uint32_t iteration = 0; iteration < k_alignment_slope_max_iterations; ++iteration)
@@ -837,7 +841,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
            bool         valid_point    = false;
            const double measured_phase = MeasurePhaseOffsetDeg(bin, &valid_point);
            std::fprintf(stderr, "align: slope iter=%u bin=%d tx_frequency_hz=%.3f "
-                       "measured_phase_deg=%+.6f valid=%d",
+                       "measured_phase_deg=%+.6f valid=%d\n",
                        iteration,
                        bin,
                        tx_frequency_hz,
@@ -860,7 +864,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         for(std::size_t index = 0; index < bins.size(); ++index)
         {
            std::fprintf(stderr, "align: slope iter=%u bin=%d wrapped_phase_deg=%+.6f "
-                       "unwrapped_phase_deg=%+.6f",
+                       "unwrapped_phase_deg=%+.6f\n",
                        iteration,
                        bins[index],
                        measured_phase_degrees[index],
@@ -881,7 +885,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
             std::fabs(fitted_slope_deg_per_bin - expected_slope_deg_per_bin);
 
         std::fprintf(stderr, 
-            "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f",
+            "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f\n",
             iteration,
             fitted_slope_deg_per_bin,
             expected_slope_deg_per_bin,
@@ -892,7 +896,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) &&
             (fitted_rms_error_deg <= residual_rms_tolerance_deg))
         {
-            std::fprintf(stderr, "align: slope search accepted on iteration %u", iteration);
+            std::fprintf(stderr, "align: slope search accepted on iteration %u\n", iteration);
            std::fflush(stderr);
             return true;
         }
@@ -961,8 +965,8 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
         }
     }
 
-    std::fprintf(stderr, "align: forced MAC back to channel A before quadrature search");
-    std::fprintf(stderr, "align: quadrature search start");
+    std::fprintf(stderr, "align: forced MAC back to channel A before quadrature search\n");
+    std::fprintf(stderr, "align: quadrature search start\n");
     std::fflush(stderr);
 
     bool aligned = false;
@@ -989,7 +993,7 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
             const double mean_absolute_phase_degrees = mean_absolute_value(unwrapped_phase_degrees);
 
             std::fprintf(stderr, 
-                "align: quadrature iter=%u mean_absolute_phase_degrees=%.6f accept_abs_mean_phase_deg=%.6f",
+                "align: quadrature iter=%u mean_absolute_phase_degrees=%.6f accept_abs_mean_phase_deg=%.6f\n",
                 iteration,
                 mean_absolute_phase_degrees,
                 accept_abs_mean_phase_deg);
@@ -997,7 +1001,7 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
 
             if (mean_absolute_phase_degrees <= accept_abs_mean_phase_deg)
             {
-                std::fprintf(stderr, "align: quadrature accepted on iteration %u", iteration);
+                std::fprintf(stderr, "align: quadrature accepted on iteration %u\n", iteration);
                 std::fflush(stderr);
                 aligned = true;
                 break;
@@ -1053,7 +1057,7 @@ OpStatus TRXLooper::AlignRxPhaseInternal()
             return mac_restore_status;
         }
     }
-    std::fprintf(stderr, "align: forced MAC back to channel A before slope search");
+    std::fprintf(stderr, "align: forced MAC back to channel A before slope search\n");
     std::fflush(stderr);
 
     lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
@@ -1066,7 +1070,7 @@ OpStatus TRXLooper::AlignRxPhaseInternal()
         decimation_index = 0;
 
     std::fprintf(stderr, 
-        "align: slope search sample_rate_hz=%.3f decimation_index=%d",
+        "align: slope search sample_rate_hz=%.3f decimation_index=%d\n",
         sample_rate_hz,
         decimation_index);
     std::fflush(stderr);
