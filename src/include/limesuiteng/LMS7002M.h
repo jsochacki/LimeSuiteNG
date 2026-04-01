@@ -891,6 +891,8 @@ class LIME_API LMS7002M
     };
 
   private:
+    friend class TRXLooper;
+
     /*!
      * @brief Sets given module registers to default values
      * @return The status of the operation

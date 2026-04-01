@@ -19,6 +19,7 @@ namespace lime {
 class FPGA;
 class IDMA;
 class LMS7002M;
+struct FPGA_RxDataPacket;
 
 /** @brief Class responsible for receiving and transmitting continuous sample data */
 class TRXLooper : public RFStream
@@ -89,6 +90,20 @@ class TRXLooper : public RFStream
     };
 
   private:
+    bool ShouldAlignRxPhase() const;
+    OpStatus AlignRxPhaseInternal();
+    bool AlignRxTSPRobust(uint32_t checkpoint_pairs);
+    bool CaptureAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout);
+    bool CheckTSPAligned(const FPGA_RxDataPacket& packet, uint32_t checkpoint_pairs) const;
+    double MeasurePhaseOffsetDeg(int bin, bool* ok);
+    bool SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_index, const std::vector<int>& bins);
+    bool AlignQuadratureRobust(const std::vector<int>& bins, double accept_abs_mean_phase_deg);
+    void ResetRxIQGeneratorAlignmentState();
+    OpStatus Flush_transport_state_for_alignment(void);
+    void Recycle_stream_packets_for_alignment(Stream& stream_state);
+    OpStatus Discard_initial_rx_dma_transfers_for_alignment(uint32_t number_of_transfers_to_discard, uint8_t irq_period);
+    OpStatus Prepare_rx_transport_for_alignment_capture(uint32_t number_of_transfers_to_discard);
+
     OpStatus RxSetup();
     void RxWorkLoop();
     void ReceivePacketsLoop();

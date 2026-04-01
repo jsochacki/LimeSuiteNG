@@ -86,16 +86,16 @@ SoapySDR::ArgInfoList Soapy_limesuiteng::getStreamArgsInfo(
     //     argInfos.push_back(info);
     // }
 
-    // // Align phase of Rx channels
-    // {
-    //     SoapySDR::ArgInfo info;
-    //     info.value = "false";
-    //     info.key = "alignPhase";
-    //     info.name = "Align phase";
-    //     info.description = "Attempt to align phase of Rx channels.";
-    //     info.type = SoapySDR::ArgInfo::BOOL;
-    //     argInfos.push_back(info);
-    // }
+    // Align phase of Rx channels
+    {
+        SoapySDR::ArgInfo info;
+        info.value = "false";
+        info.key = "alignPhase";
+        info.name = "Align phase";
+        info.description = "Attempt to align phase of paired Rx channels before streaming starts.";
+        info.type = SoapySDR::ArgInfo::BOOL;
+        argInfos.push_back(info);
+    }
 
     return argInfos;
 }
@@ -157,6 +157,14 @@ SoapySDR::Stream* Soapy_limesuiteng::setupStream(
         {
             throw std::runtime_error("Soapy_limesuiteng::setupStream(linkFormat=" + linkFormat + ") unsupported link format");
         }
+    }
+
+    config.alignPhase = false;
+    if (args.count("alignPhase"))
+    {
+        const std::string align_phase_value = args.at("alignPhase");
+        config.alignPhase =
+            (align_phase_value == "true") || (align_phase_value == "TRUE") || (align_phase_value == "1");
     }
 
     // TODO: reimplement if relevant
@@ -245,7 +253,14 @@ int Soapy_limesuiteng::activateStream(SoapySDR::Stream* stream, const int flags,
     icstream->rxBurstRequest = (flags & SOAPY_SDR_HAS_TIME) | (flags & SOAPY_SDR_END_BURST);
     icstream->rxBurstSamples = numElems;
 
-    rfstream->Start();
+    const OpStatus start_status = rfstream->Start();
+    if (start_status != OpStatus::Success)
+    {
+        SoapySDR::log(
+            SOAPY_SDR_ERROR, "Soapy_limesuiteng::activateStream() failed to start the RF stream: " + lime::GetLastErrorMessage());
+        return SOAPY_SDR_STREAM_ERROR;
+    }
+
     isStreamRunning = true;
     return 0;
 }
