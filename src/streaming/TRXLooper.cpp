@@ -193,6 +193,28 @@ static OpStatus WriteAlignmentRegistersToBothChannels(
     return lms->SetActiveChannel(LMS7002M::Channel::ChA);
 }
 
+static double
+compute_single_bin_power(const std::vector<complex16_t>& samples,
+                         int                             bin,
+                         int                             dft_length)
+{
+   const std::complex<double> imaginary_unit(0.0, 1.0);
+   const double               pi = std::acos(-1.0);
+   std::complex<double>       spectrum(0.0, 0.0);
+   for(int sample_index = 0; sample_index < dft_length; ++sample_index)
+   {
+      const std::complex<double> sample_value(
+         static_cast<double>(samples[sample_index].real()),
+         static_cast<double>(samples[sample_index].imag()));
+      const std::complex<double> phasor
+         = std::exp((-2.0 * imaginary_unit * pi * static_cast<double>(bin)
+                     * static_cast<double>(sample_index))
+                    / static_cast<double>(dft_length));
+      spectrum += sample_value * phasor;
+   }
+   return std::norm(spectrum);
+}
+
 } // namespace
 
 static struct tm ReadUTC(FPGA* fpga, uint16_t base)
@@ -755,15 +777,26 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
         spectrum_b += sample_b * phasor;
     }
 
-    double phase_degrees = std::arg(spectrum_b) * 180.0 / pi - std::arg(spectrum_a) * 180.0 / pi;
-    while (phase_degrees < -180.0)
-        phase_degrees += 360.0;
-    while (phase_degrees > 180.0)
-        phase_degrees -= 360.0;
-
-    if (ok)
-        *ok = true;
-    return phase_degrees;
+   const double power_a
+      = compute_single_bin_power(channel_a_samples, bin, dft_length);
+   const double power_b
+      = compute_single_bin_power(channel_b_samples, bin, dft_length);
+   double phase_degrees
+      = std::arg(spectrum_b) * 180.0 / pi - std::arg(spectrum_a) * 180.0 / pi;
+   while(phase_degrees < -180.0) phase_degrees += 360.0;
+   while(phase_degrees > 180.0) phase_degrees -= 360.0;
+   lime::debug("align: bin=%d phase_deg=%+.6f power_a=%.3e power_b=%.3e "
+               "payload_bytes=%u samples=%zu",
+               bin,
+               phase_degrees,
+               power_a,
+               power_b,
+               packet.GetPayloadSize() == 0
+                  ? static_cast<unsigned>(sizeof(packet.data))
+                  : packet.GetPayloadSize(),
+               channel_a_samples.size());
+   if(ok) *ok = true;
+   return phase_degrees;
 }
 
 bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_index, const std::vector<int>& bins)
@@ -792,24 +825,42 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         std::vector<double> measured_phase_degrees;
         measured_phase_degrees.reserve(bins.size());
         bool all_points_valid = true;
-        for (int bin : bins)
+        for(int bin : bins)
         {
-            const double tx_frequency_hz = 450.0e6 + sample_rate_hz * static_cast<double>(bin) / 512.0;
-            lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
-            bool valid_point = false;
-            const double measured_phase = MeasurePhaseOffsetDeg(bin, &valid_point);
-            if (!valid_point)
-            {
-                all_points_valid = false;
-                break;
-            }
-            measured_phase_degrees.push_back(measured_phase);
+           const double tx_frequency_hz
+              = 450.0e6 + sample_rate_hz * static_cast<double>(bin) / 512.0;
+           lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
+           bool         valid_point    = false;
+           const double measured_phase = MeasurePhaseOffsetDeg(bin, &valid_point);
+           lime::debug("align: slope iter=%u bin=%d tx_frequency_hz=%.3f "
+                       "measured_phase_deg=%+.6f valid=%d",
+                       iteration,
+                       bin,
+                       tx_frequency_hz,
+                       measured_phase,
+                       valid_point ? 1 : 0);
+           if(!valid_point)
+           {
+              all_points_valid = false;
+              break;
+           }
+           measured_phase_degrees.push_back(measured_phase);
         }
 
         if (!all_points_valid)
             continue;
 
         const std::vector<double> unwrapped_phase_degrees = unwrap_phase_degrees(measured_phase_degrees);
+
+        for(std::size_t index = 0; index < bins.size(); ++index)
+        {
+           lime::debug("align: slope iter=%u bin=%d wrapped_phase_deg=%+.6f "
+                       "unwrapped_phase_deg=%+.6f",
+                       iteration,
+                       bins[index],
+                       measured_phase_degrees[index],
+                       unwrapped_phase_degrees[index]);
+        }
 
         double fitted_slope_deg_per_bin = 0.0;
         double fitted_intercept_deg = 0.0;
