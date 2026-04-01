@@ -666,11 +666,11 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
             aligned = true;
             break;
         }
+    }
 
-        if (!aligned)
-        {
-            lime::warning("align: tsp search exhausted without success");
-        }
+    if (!aligned)
+    {
+        lime::warning("align: tsp search exhausted without success");
     }
 
     {
@@ -689,6 +689,12 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
 
 void TRXLooper::ResetRxIQGeneratorAlignmentState()
 {
+   const OpStatus channel_status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+   if (channel_status != OpStatus::Success)
+   {
+       return;
+   }
+
     uint16_t reg20 = lms->SPI_read(0x0020, true);
     uint16_t reg10c = 0;
     uint16_t reg11c = lms->SPI_read(0x011C, true);
@@ -853,12 +859,6 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
     lms->SPI_write(0x0400, 0x8081, true);
     lms->SPI_write(0x040C, 0x01FF, true);
     lms->SPI_write(0x0404, 0x0006, true);
-    lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
-    lms->SPI_write(0x0020, 0xFFFE, true);
-    lms->SPI_write(0x0105, 0x0006, true);
-    lms->SPI_write(0x0100, 0x4038, true);
-    lms->SPI_write(0x0113, 0x007F, true);
-    lms->SPI_write(0x0119, 0x529B, true);
 
    {
        const OpStatus status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
@@ -869,6 +869,14 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
            return false;
        }
    }
+
+    lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+    lms->SPI_write(0x0020, 0xFFFE, true);
+    lms->SPI_write(0x0105, 0x0006, true);
+    lms->SPI_write(0x0100, 0x4038, true);
+    lms->SPI_write(0x0113, 0x007F, true);
+    lms->SPI_write(0x0119, 0x529B, true);
+
 
     uint16_t path_value = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
     lms->SPI_write(0x010D, path_value == 3 ? 0x018F : path_value == 2 ? 0x0117 : 0x008F, true);
@@ -971,8 +979,7 @@ OpStatus TRXLooper::AlignRxPhaseInternal()
     lms->SPI_write(0x0400, 0x8081, true);
     lms->SPI_write(0x040C, 0x01FF, true);
     lms->SPI_write(0x0404, 0x0006, true);
-    lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
- 
+
     {
         const OpStatus mac_restore_status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
         if (mac_restore_status != OpStatus::Success)
@@ -984,8 +991,9 @@ OpStatus TRXLooper::AlignRxPhaseInternal()
             return mac_restore_status;
         }
     }
-
     lime::debug("align: forced MAC back to channel A before slope search");
+
+    lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
 
     const double sample_rate_hz = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
     lms->SetFrequencySX(TRXDir::Rx, 450.0e6);
