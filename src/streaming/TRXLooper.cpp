@@ -41,7 +41,10 @@ static constexpr uint32_t k_alignment_slope_max_iterations = 256;
 static constexpr uint32_t k_alignment_quadrature_max_iterations = 128;
 static constexpr double k_alignment_quadrature_accept_mean_deg = 45.0;
 
-static_assert(offsetof(FPGA_RxDataPacket, reserved) == 0, "unexpected FPGA_RxDataPacket layout");
+static_assert(offsetof(FPGA_RxDataPacket, header0) == 0, "unexpected FPGA_RxDataPacket layout");
+static_assert(offsetof(FPGA_RxDataPacket, payloadSizeLSB) == 1, "unexpected FPGA_RxDataPacket layout");
+static_assert(offsetof(FPGA_RxDataPacket, payloadSizeMSB) == 2, "unexpected FPGA_RxDataPacket layout");
+static_assert(offsetof(FPGA_RxDataPacket, reserved) == 3, "unexpected FPGA_RxDataPacket layout");
 static_assert(offsetof(FPGA_RxDataPacket, counter) == 8, "unexpected FPGA_RxDataPacket layout");
 static_assert(offsetof(FPGA_RxDataPacket, data) == 16, "unexpected FPGA_RxDataPacket layout");
 static_assert(sizeof(FPGA_RxDataPacket) == 4096, "unexpected FPGA_RxDataPacket size");
@@ -692,7 +695,8 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
     {
         const complex64f_t sample_a(channel_a_samples[sample_index].real(), channel_a_samples[sample_index].imag());
         const complex64f_t sample_b(channel_b_samples[sample_index].real(), channel_b_samples[sample_index].imag());
-        const complex64f_t phasor = std::exp((-2.0 * imaginary_unit * pi * static_cast<double>(bin) * sample_index) /
+        const complex64f_t phasor = std::exp((-2.0 * imaginary_unit * pi * static_cast<double>(bin) *
+                                                 static_cast<double>(sample_index)) /
             static_cast<double>(dft_length));
         spectrum_a += sample_a * phasor;
         spectrum_b += sample_b * phasor;
