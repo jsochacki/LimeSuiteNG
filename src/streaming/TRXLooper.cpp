@@ -159,6 +159,40 @@ bool deinterleave_alignment_packet(const StreamConfig& config,
     return true;
 }
 
+static OpStatus WriteAlignmentRegistersToBothChannels(
+    LMS7002M* lms,
+    uint16_t address_0,
+    uint16_t value_0,
+    uint16_t address_1,
+    uint16_t value_1)
+{
+    OpStatus status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+    if (status != OpStatus::Success)
+        return status;
+
+    status = lms->SPI_write(address_0, value_0, true);
+    if (status != OpStatus::Success)
+        return status;
+
+    status = lms->SPI_write(address_1, value_1, true);
+    if (status != OpStatus::Success)
+        return status;
+
+    status = lms->SetActiveChannel(LMS7002M::Channel::ChB);
+    if (status != OpStatus::Success)
+        return status;
+
+    status = lms->SPI_write(address_0, value_0, true);
+    if (status != OpStatus::Success)
+        return status;
+
+    status = lms->SPI_write(address_1, value_1, true);
+    if (status != OpStatus::Success)
+        return status;
+
+    return lms->SetActiveChannel(LMS7002M::Channel::ChA);
+}
+
 } // namespace
 
 static struct tm ReadUTC(FPGA* fpga, uint16_t base)
@@ -592,10 +626,17 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
     }
 
     {
-        LMS7002M::ChannelScope channel_ab_scope(lms, LMS7002M::Channel::ChAB);
-        lms->SPI_write(0x0400, 0x8085, true);
-        lms->SPI_write(0x040C, 0x01FF, true);
+        const OpStatus write_both_status =
+            WriteAlignmentRegistersToBothChannels(lms, 0x0400, 0x8085, 0x040C, 0x01FF);
+
+        if (write_both_status != OpStatus::Success)
+        {
+            lime::warning("align: failed to write temporary RxTSP alignment registers to both channels");
+            return false;
+        }
     }
+
+    lime::debug("align: tsp search start");
 
     bool aligned = false;
     for (uint32_t iteration = 0; iteration < k_alignment_tsp_max_iterations; ++iteration)
@@ -621,8 +662,14 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
 
         if (CheckTSPAligned(packet, checkpoint_pairs))
         {
+            lime::debug("align: tsp aligned on iteration %u", iteration);
             aligned = true;
             break;
+        }
+
+        if (!aligned)
+        {
+            lime::warning("align: tsp search exhausted without success");
         }
     }
 
@@ -726,6 +773,8 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
     const double slope_tolerance_deg_per_bin = legacy_tolerances[decimation_index] / 32.0;
     const double residual_rms_tolerance_deg = std::max(2.0, legacy_tolerances[decimation_index] * 8.0);
 
+    lime::debug("align: slope search start");
+
     for (uint32_t iteration = 0; iteration < k_alignment_slope_max_iterations; ++iteration)
     {
         lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_FDIV_O_CGEN, 1, true);
@@ -765,11 +814,23 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
             continue;
         }
 
-        const double slope_error_deg_per_bin = std::fabs(fitted_slope_deg_per_bin - expected_slope_deg_per_bin);
-        if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) && (fitted_rms_error_deg <= residual_rms_tolerance_deg))
+        lime::debug(
+            "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f",
+            iteration,
+            fitted_slope_deg_per_bin,
+            expected_slope_deg_per_bin,
+            slope_error_deg_per_bin,
+            fitted_rms_error_deg);
+
+        if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) &&
+            (fitted_rms_error_deg <= residual_rms_tolerance_deg))
+        {
+            lime::debug("align: slope search accepted on iteration %u", iteration);
             return true;
+        }
     }
 
+    lime::warning("align: slope search exhausted without success");
     return false;
 }
 
@@ -809,6 +870,19 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
     const double rx_frequency_hz = lms->GetFrequencySX(TRXDir::Rx);
     lms->SetFrequencySX(TRXDir::Tx, rx_frequency_hz + sample_rate_hz / 16.0);
 
+    {
+        const OpStatus mac_restore_status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+        if (mac_restore_status != OpStatus::Success)
+        {
+            if (register_backup)
+                lms->RestoreRegisterMap(register_backup);
+            return false;
+        }
+    }
+
+    lime::debug("align: forced MAC back to channel A before quadrature search");
+    lime::debug("align: quadrature search start");
+
     bool aligned = false;
     for (uint32_t iteration = 0; iteration < k_alignment_quadrature_max_iterations; ++iteration)
     {
@@ -831,14 +905,27 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
         {
             const std::vector<double> unwrapped_phase_degrees = unwrap_phase_degrees(measured_phase_degrees);
             const double mean_absolute_phase_degrees = mean_absolute_value(unwrapped_phase_degrees);
+
+            lime::debug(
+                "align: quadrature iter=%u mean_absolute_phase_degrees=%.6f accept_abs_mean_phase_deg=%.6f",
+                iteration,
+                mean_absolute_phase_degrees,
+                accept_abs_mean_phase_deg);
+
             if (mean_absolute_phase_degrees <= accept_abs_mean_phase_deg)
             {
+                lime::debug("align: quadrature accepted on iteration %u", iteration);
                 aligned = true;
                 break;
             }
         }
 
         ResetRxIQGeneratorAlignmentState();
+    }
+
+    if (!aligned)
+    {
+        lime::warning("align: quadrature search exhausted without success");
     }
 
     if (register_backup)
@@ -871,6 +958,20 @@ OpStatus TRXLooper::AlignRxPhaseInternal()
     lms->SPI_write(0x040C, 0x01FF, true);
     lms->SPI_write(0x0404, 0x0006, true);
     lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+ 
+    {
+        const OpStatus mac_restore_status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+        if (mac_restore_status != OpStatus::Success)
+        {
+            if (register_backup)
+                lms->RestoreRegisterMap(register_backup);
+
+            lms->SPI_write(0x0020, mac_backup, true);
+            return mac_restore_status;
+        }
+    }
+
+    lime::debug("align: forced MAC back to channel A before slope search");
 
     const double sample_rate_hz = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
     lms->SetFrequencySX(TRXDir::Rx, 450.0e6);
@@ -878,6 +979,11 @@ OpStatus TRXLooper::AlignRxPhaseInternal()
     int decimation_index = lms->Get_SPI_Reg_bits(LMS7002MCSR::HBD_OVR_RXTSP, true);
     if (decimation_index > 4)
         decimation_index = 0;
+
+    lime::debug(
+        "align: slope search sample_rate_hz=%.3f decimation_index=%d",
+        sample_rate_hz,
+        decimation_index);
 
     const std::vector<int> slope_bins = { 16, 24, 32, 40, 48, 56, 64 };
     const bool slope_state_ok = SearchRxPhaseSlopeState(sample_rate_hz, decimation_index, slope_bins);
