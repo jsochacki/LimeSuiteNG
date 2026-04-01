@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstddef>
 #include <ciso646>
 #include <complex>
 #include <queue>
@@ -33,6 +34,129 @@ static constexpr uint16_t defaultSamplesInPkt = 1360;
 
 static constexpr bool showStats{ false };
 static constexpr int statsPeriod_ms{ 1000 }; // at 122.88 MHz MIMO, fpga tx pkt counter overflows every 272ms
+
+static constexpr uint32_t k_alignment_tsp_checkpoint_pairs = 8;
+static constexpr uint32_t k_alignment_tsp_max_iterations = 128;
+static constexpr uint32_t k_alignment_slope_max_iterations = 256;
+static constexpr uint32_t k_alignment_quadrature_max_iterations = 128;
+static constexpr double k_alignment_quadrature_accept_mean_deg = 45.0;
+
+static_assert(offsetof(FPGA_RxDataPacket, reserved) == 0, "unexpected FPGA_RxDataPacket layout");
+static_assert(offsetof(FPGA_RxDataPacket, counter) == 8, "unexpected FPGA_RxDataPacket layout");
+static_assert(offsetof(FPGA_RxDataPacket, data) == 16, "unexpected FPGA_RxDataPacket layout");
+static_assert(sizeof(FPGA_RxDataPacket) == 4096, "unexpected FPGA_RxDataPacket size");
+
+namespace {
+
+std::vector<double> unwrap_phase_degrees(const std::vector<double>& wrapped_phase_degrees)
+{
+    std::vector<double> unwrapped_phase_degrees = wrapped_phase_degrees;
+    if (unwrapped_phase_degrees.empty())
+        return unwrapped_phase_degrees;
+
+    for (std::size_t index = 1; index < unwrapped_phase_degrees.size(); ++index)
+    {
+        double phase_delta_degrees = unwrapped_phase_degrees[index] - unwrapped_phase_degrees[index - 1];
+        while (phase_delta_degrees > 180.0)
+        {
+            unwrapped_phase_degrees[index] -= 360.0;
+            phase_delta_degrees -= 360.0;
+        }
+        while (phase_delta_degrees < -180.0)
+        {
+            unwrapped_phase_degrees[index] += 360.0;
+            phase_delta_degrees += 360.0;
+        }
+    }
+    return unwrapped_phase_degrees;
+}
+
+bool linear_fit_phase_vs_bin(const std::vector<int>& bins,
+    const std::vector<double>& phase_degrees,
+    double* slope_degrees_per_bin,
+    double* intercept_degrees,
+    double* rms_error_degrees)
+{
+    if ((bins.size() != phase_degrees.size()) || bins.empty())
+        return false;
+
+    double sum_x = 0.0;
+    double sum_y = 0.0;
+    double sum_xx = 0.0;
+    double sum_xy = 0.0;
+    const double point_count = static_cast<double>(bins.size());
+
+    for (std::size_t index = 0; index < bins.size(); ++index)
+    {
+        const double x_value = static_cast<double>(bins[index]);
+        const double y_value = phase_degrees[index];
+        sum_x += x_value;
+        sum_y += y_value;
+        sum_xx += x_value * x_value;
+        sum_xy += x_value * y_value;
+    }
+
+    const double denominator = point_count * sum_xx - sum_x * sum_x;
+    if (std::fabs(denominator) < 1.0e-12)
+        return false;
+
+    const double fitted_slope = (point_count * sum_xy - sum_x * sum_y) / denominator;
+    const double fitted_intercept = (sum_y - fitted_slope * sum_x) / point_count;
+
+    double squared_error_sum = 0.0;
+    for (std::size_t index = 0; index < bins.size(); ++index)
+    {
+        const double x_value = static_cast<double>(bins[index]);
+        const double fitted_value = fitted_intercept + fitted_slope * x_value;
+        const double error_value = phase_degrees[index] - fitted_value;
+        squared_error_sum += error_value * error_value;
+    }
+
+    *slope_degrees_per_bin = fitted_slope;
+    *intercept_degrees = fitted_intercept;
+    *rms_error_degrees = std::sqrt(squared_error_sum / point_count);
+    return true;
+}
+
+double mean_absolute_value(const std::vector<double>& values)
+{
+    if (values.empty())
+        return 0.0;
+
+    double absolute_sum = 0.0;
+    for (double value : values)
+        absolute_sum += std::fabs(value);
+    return absolute_sum / static_cast<double>(values.size());
+}
+
+bool deinterleave_alignment_packet(const StreamConfig& config,
+    const FPGA_RxDataPacket& packet,
+    std::vector<complex16_t>* channel_a_samples,
+    std::vector<complex16_t>* channel_b_samples)
+{
+    if ((!channel_a_samples) || (!channel_b_samples))
+        return false;
+
+    channel_a_samples->assign(2048, complex16_t(0, 0));
+    channel_b_samples->assign(2048, complex16_t(0, 0));
+
+    void* destinations[2] = { channel_a_samples->data(), channel_b_samples->data() };
+    DataConversion conversion{};
+    conversion.srcFormat = config.linkFormat;
+    conversion.destFormat = DataFormat::I16;
+    conversion.channelCount = 2;
+
+    const uint16_t payload_size_bytes = packet.GetPayloadSize() == 0 ? sizeof(packet.data) : packet.GetPayloadSize();
+    const int samples_deinterleaved = Deinterleave(destinations, packet.data, payload_size_bytes, conversion);
+    if (samples_deinterleaved < 512)
+        return false;
+
+    channel_a_samples->resize(samples_deinterleaved);
+    channel_b_samples->resize(samples_deinterleaved);
+    return true;
+}
+
+} // namespace
 
 static struct tm ReadUTC(FPGA* fpga, uint16_t base)
 {
@@ -154,6 +278,625 @@ uint64_t TRXLooper::GetHardwareTimestamp() const
 OpStatus TRXLooper::SetHardwareTimestamp(const uint64_t now)
 {
     mTimestampOffset = now - mRx.lastTimestamp.load(std::memory_order_relaxed);
+    return OpStatus::Success;
+}
+
+void TRXLooper::Recycle_stream_packets_for_alignment(Stream& stream_state)
+{
+    StreamPacket* packet_pointer = nullptr;
+
+    if (stream_state.stagingPacket != nullptr)
+    {
+        stream_state.stagingPacket->Reset();
+
+        if (stream_state.packetsPool)
+            stream_state.packetsPool->push(stream_state.stagingPacket, true);
+        else
+            delete stream_state.stagingPacket;
+
+        stream_state.stagingPacket = nullptr;
+    }
+
+    if (stream_state.fifo != nullptr)
+    {
+        while (stream_state.fifo->pop(&packet_pointer, false))
+        {
+            if (packet_pointer != nullptr)
+            {
+                packet_pointer->Reset();
+
+                if (stream_state.packetsPool)
+                    stream_state.packetsPool->push(packet_pointer, true);
+                else
+                    delete packet_pointer;
+            }
+        }
+
+        stream_state.fifo->clear();
+    }
+}
+
+OpStatus TRXLooper::Flush_transport_state_for_alignment(void)
+{
+    OpStatus status = OpStatus::Success;
+
+    if (mStreamEnabled)
+    {
+        return ReportError(
+            OpStatus::Busy, "Flush_transport_state_for_alignment() requires mStreamEnabled == false");
+    }
+
+    if (mRx.stage.load(std::memory_order_relaxed) == Stream::ReadyStage::Active)
+    {
+        return ReportError(OpStatus::Busy, "Flush_transport_state_for_alignment() requires Rx worker idle");
+    }
+
+    if (mTx.stage.load(std::memory_order_relaxed) == Stream::ReadyStage::Active)
+    {
+        return ReportError(OpStatus::Busy, "Flush_transport_state_for_alignment() requires Tx worker idle");
+    }
+
+    status = fpga->SelectModule(chipId);
+    if (status != OpStatus::Success)
+        return status;
+
+    fpga->StopWaveformPlayback();
+    fpga->StopStreaming();
+
+    if (mRxArgs.dma)
+    {
+        status = mRxArgs.dma->Enable(false);
+        if (status != OpStatus::Success)
+            return status;
+    }
+
+    if (mTxArgs.dma)
+    {
+        status = mTxArgs.dma->Enable(false);
+        if (status != OpStatus::Success)
+            return status;
+    }
+
+    if (mRxArgs.dma)
+    {
+        for (uint16_t buffer_index = 0; buffer_index < mRxArgs.buffers.size(); ++buffer_index)
+            mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
+    }
+
+    if (mTxArgs.dma)
+    {
+        for (uint16_t buffer_index = 0; buffer_index < mTxArgs.buffers.size(); ++buffer_index)
+            mTxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
+    }
+
+    Recycle_stream_packets_for_alignment(mRx);
+    Recycle_stream_packets_for_alignment(mTx);
+
+    mRx.lastTimestamp.store(0, std::memory_order_relaxed);
+    mTx.lastTimestamp.store(0, std::memory_order_relaxed);
+    mTimestampOffset = 0;
+
+    fpga->ResetPacketCounters(chipId);
+    fpga->ResetTimestamp();
+
+    startUnixTime = 0;
+    startUnixTimeSet = false;
+
+    mRx.terminate.store(false, std::memory_order_relaxed);
+    mTx.terminate.store(false, std::memory_order_relaxed);
+
+    return OpStatus::Success;
+}
+
+OpStatus TRXLooper::Discard_initial_rx_dma_transfers_for_alignment(uint32_t number_of_transfers_to_discard, uint8_t irq_period)
+{
+    OpStatus status = OpStatus::Success;
+    IDMA::State dma_state;
+    uint64_t last_completed_transfer_count = 0;
+    uint64_t submit_request_count = 0;
+    uint32_t discarded_transfer_count = 0;
+    uint32_t current_buffer_index = 0;
+    uint32_t buffer_count = 0;
+    uint32_t read_size_bytes = 0;
+    bool request_irq = false;
+
+    if (mStreamEnabled)
+    {
+        return ReportError(
+            OpStatus::Busy, "Discard_initial_rx_dma_transfers_for_alignment() requires mStreamEnabled == false");
+    }
+
+    if (mRx.stage.load(std::memory_order_relaxed) == Stream::ReadyStage::Active)
+    {
+        return ReportError(OpStatus::Busy, "Discard_initial_rx_dma_transfers_for_alignment() requires Rx worker idle");
+    }
+
+    if (mTx.stage.load(std::memory_order_relaxed) == Stream::ReadyStage::Active)
+    {
+        return ReportError(OpStatus::Busy, "Discard_initial_rx_dma_transfers_for_alignment() requires Tx worker idle");
+    }
+
+    if (mRxArgs.dma == nullptr)
+    {
+        return ReportError(
+            OpStatus::InvalidValue, "Discard_initial_rx_dma_transfers_for_alignment() requires a valid Rx DMA object");
+    }
+
+    if (mRxArgs.buffers.empty())
+    {
+        return ReportError(OpStatus::InvalidValue,
+            "Discard_initial_rx_dma_transfers_for_alignment() requires allocated Rx DMA buffers");
+    }
+
+    if (mRxArgs.packetSize == 0 || mRxArgs.packetsToBatch == 0)
+    {
+        return ReportError(
+            OpStatus::InvalidValue, "Discard_initial_rx_dma_transfers_for_alignment() requires valid Rx packet sizing");
+    }
+
+    if (number_of_transfers_to_discard == 0)
+        return OpStatus::Success;
+
+    buffer_count = static_cast<uint32_t>(mRxArgs.buffers.size());
+    read_size_bytes = mRxArgs.packetSize * mRxArgs.packetsToBatch;
+
+    dma_state = mRxArgs.dma->GetCounters();
+    last_completed_transfer_count = dma_state.transfersCompleted;
+
+    while (discarded_transfer_count < number_of_transfers_to_discard)
+    {
+        status = mRxArgs.dma->Wait();
+        if (status != OpStatus::Success)
+            return status;
+
+        dma_state = mRxArgs.dma->GetCounters();
+
+        while (last_completed_transfer_count != dma_state.transfersCompleted &&
+            discarded_transfer_count < number_of_transfers_to_discard)
+        {
+            current_buffer_index = static_cast<uint32_t>(submit_request_count % buffer_count);
+
+            mRxArgs.dma->BufferOwnership(static_cast<uint16_t>(current_buffer_index), DataTransferDirection::DeviceToHost);
+
+            mRxArgs.dma->BufferOwnership(static_cast<uint16_t>(current_buffer_index), DataTransferDirection::HostToDevice);
+
+            request_irq = ((submit_request_count % irq_period) == 0);
+
+            status = mRxArgs.dma->SubmitRequest(
+                current_buffer_index, read_size_bytes, DataTransferDirection::DeviceToHost, request_irq);
+            if (status != OpStatus::Success)
+                return status;
+
+            ++submit_request_count;
+            ++discarded_transfer_count;
+            ++last_completed_transfer_count;
+        }
+    }
+
+    return OpStatus::Success;
+}
+
+OpStatus TRXLooper::Prepare_rx_transport_for_alignment_capture(uint32_t number_of_transfers_to_discard)
+{
+    OpStatus status = Flush_transport_state_for_alignment();
+    uint32_t read_size_bytes = 0;
+    constexpr uint8_t irq_period = 4;
+
+    if (status != OpStatus::Success)
+        return status;
+
+    read_size_bytes = mRxArgs.packetSize * mRxArgs.packetsToBatch;
+
+    status = mRxArgs.dma->EnableContinuous(true, read_size_bytes, irq_period);
+    if (status != OpStatus::Success)
+        return status;
+
+    status = fpga->SelectModule(chipId);
+    if (status != OpStatus::Success)
+    {
+        mRxArgs.dma->Enable(false);
+        return status;
+    }
+
+    fpga->StartStreaming();
+
+    status = Discard_initial_rx_dma_transfers_for_alignment(number_of_transfers_to_discard, irq_period);
+    if (status != OpStatus::Success)
+    {
+        fpga->StopStreaming();
+        mRxArgs.dma->Enable(false);
+        return status;
+    }
+
+    return OpStatus::Success;
+}
+
+bool TRXLooper::ShouldAlignRxPhase() const
+{
+    const auto rx_it = mConfig.channels.find(TRXDir::Rx);
+    if (rx_it == mConfig.channels.end())
+        return false;
+
+    return mConfig.alignPhase && (rx_it->second.size() == 2);
+}
+
+bool TRXLooper::CaptureAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout)
+{
+    if (!packet)
+        return false;
+
+    const auto start_time = std::chrono::steady_clock::now();
+    const auto buffer_count = mRxArgs.buffers.size();
+    uint64_t last_completed = mRxArgs.dma->GetCounters().transfersCompleted;
+
+    while ((std::chrono::steady_clock::now() - start_time) < timeout)
+    {
+        if (mRxArgs.dma->Wait() != OpStatus::Success)
+            continue;
+
+        const auto state = mRxArgs.dma->GetCounters();
+        if (state.transfersCompleted == last_completed)
+            continue;
+
+        last_completed = state.transfersCompleted;
+        const uint64_t completed_index = last_completed - 1;
+        const uint16_t buffer_index = static_cast<uint16_t>(completed_index % buffer_count);
+        mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
+        std::memcpy(packet, mRxArgs.buffers.at(buffer_index), sizeof(FPGA_RxDataPacket));
+        mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
+        return true;
+    }
+
+    return false;
+}
+
+bool TRXLooper::CheckTSPAligned(const FPGA_RxDataPacket& packet, uint32_t checkpoint_pairs) const
+{
+    const uint16_t payload_size_bytes = packet.GetPayloadSize() == 0 ? sizeof(packet.data) : packet.GetPayloadSize();
+    const uint32_t payload_word_count = payload_size_bytes / sizeof(uint32_t);
+    const uint32_t required_word_count = checkpoint_pairs * 2;
+    if (payload_word_count < required_word_count)
+        return false;
+
+    const uint32_t* payload_words = reinterpret_cast<const uint32_t*>(packet.data);
+    for (uint32_t pair_index = 0; pair_index < checkpoint_pairs; ++pair_index)
+    {
+        const uint32_t left_word = payload_words[2 * pair_index + 0];
+        const uint32_t right_word = payload_words[2 * pair_index + 1];
+        if (left_word != right_word)
+            return false;
+    }
+
+    return true;
+}
+
+bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
+{
+    uint16_t reg0400_a = 0;
+    uint16_t reg040c_a = 0;
+    uint16_t reg0400_b = 0;
+    uint16_t reg040c_b = 0;
+
+    {
+        LMS7002M::ChannelScope channel_a_scope(lms, LMS7002M::Channel::ChA);
+        reg0400_a = lms->SPI_read(0x0400, true);
+        reg040c_a = lms->SPI_read(0x040C, true);
+    }
+    {
+        LMS7002M::ChannelScope channel_b_scope(lms, LMS7002M::Channel::ChB);
+        reg0400_b = lms->SPI_read(0x0400, true);
+        reg040c_b = lms->SPI_read(0x040C, true);
+    }
+
+    {
+        LMS7002M::ChannelScope channel_ab_scope(lms, LMS7002M::Channel::ChAB);
+        lms->SPI_write(0x0400, 0x8085, true);
+        lms->SPI_write(0x040C, 0x01FF, true);
+    }
+
+    bool aligned = false;
+    for (uint32_t iteration = 0; iteration < k_alignment_tsp_max_iterations; ++iteration)
+    {
+        {
+            LMS7002M::ChannelScope channel_scope(lms, LMS7002M::Channel::ChA);
+            lms->SPI_write(0x0020, 0x55FE, true);
+            lms->SPI_write(0x0020, 0xFFFD, true);
+        }
+
+        const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
+        if (prepare_status != OpStatus::Success)
+            continue;
+
+        FPGA_RxDataPacket packet;
+        const bool have_packet = CaptureAlignmentPacket(&packet, std::chrono::milliseconds(50));
+
+        fpga->StopStreaming();
+        mRxArgs.dma->Enable(false);
+
+        if (!have_packet)
+            continue;
+
+        if (CheckTSPAligned(packet, checkpoint_pairs))
+        {
+            aligned = true;
+            break;
+        }
+    }
+
+    {
+        LMS7002M::ChannelScope channel_a_scope(lms, LMS7002M::Channel::ChA);
+        lms->SPI_write(0x0400, reg0400_a, true);
+        lms->SPI_write(0x040C, reg040c_a, true);
+    }
+    {
+        LMS7002M::ChannelScope channel_b_scope(lms, LMS7002M::Channel::ChB);
+        lms->SPI_write(0x0400, reg0400_b, true);
+        lms->SPI_write(0x040C, reg040c_b, true);
+    }
+
+    return aligned;
+}
+
+void TRXLooper::ResetRxIQGeneratorAlignmentState()
+{
+    uint16_t reg20 = lms->SPI_read(0x0020, true);
+    uint16_t reg10c = 0;
+    uint16_t reg11c = lms->SPI_read(0x011C, true);
+
+    {
+        LMS7002M::ChannelScope channel_scope(lms, LMS7002M::Channel::ChA);
+        reg10c = lms->SPI_read(0x010C, true);
+    }
+
+    lms->SPI_write(0x0020, 0xFFFD, true);
+    lms->SPI_write(0x011C, static_cast<uint16_t>(reg11c | 0x0010), true);
+    lms->SPI_write(0x0020, 0xFFFF, true);
+    lms->SPI_write(0x0124, 0x001F, true);
+    lms->SPI_write(0x010C, static_cast<uint16_t>(reg10c | 0x0008), true);
+    lms->SPI_write(0x010C, reg10c, true);
+    lms->SPI_write(0x0020, 0xFFFD, true);
+    lms->SPI_write(0x011C, reg11c, true);
+    lms->SPI_write(0x0020, reg20, true);
+}
+
+double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
+{
+    if (ok)
+        *ok = false;
+
+    const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
+    if (prepare_status != OpStatus::Success)
+        return 0.0;
+
+    FPGA_RxDataPacket packet;
+    const bool have_packet = CaptureAlignmentPacket(&packet, std::chrono::milliseconds(50));
+
+    fpga->StopStreaming();
+    mRxArgs.dma->Enable(false);
+
+    if (!have_packet)
+        return 0.0;
+
+    std::vector<complex16_t> channel_a_samples;
+    std::vector<complex16_t> channel_b_samples;
+    if (!deinterleave_alignment_packet(mConfig, packet, &channel_a_samples, &channel_b_samples))
+        return 0.0;
+
+    static constexpr int dft_length = 512;
+    const complex64f_t imaginary_unit(0.0, 1.0);
+    const double pi = std::acos(-1.0);
+
+    complex64f_t spectrum_a(0.0, 0.0);
+    complex64f_t spectrum_b(0.0, 0.0);
+    for (int sample_index = 0; sample_index < dft_length; ++sample_index)
+    {
+        const complex64f_t sample_a(channel_a_samples[sample_index].real(), channel_a_samples[sample_index].imag());
+        const complex64f_t sample_b(channel_b_samples[sample_index].real(), channel_b_samples[sample_index].imag());
+        const complex64f_t phasor = std::exp((-2.0 * imaginary_unit * pi * static_cast<double>(bin) * sample_index) /
+            static_cast<double>(dft_length));
+        spectrum_a += sample_a * phasor;
+        spectrum_b += sample_b * phasor;
+    }
+
+    double phase_degrees = std::arg(spectrum_b) * 180.0 / pi - std::arg(spectrum_a) * 180.0 / pi;
+    while (phase_degrees < -180.0)
+        phase_degrees += 360.0;
+    while (phase_degrees > 180.0)
+        phase_degrees -= 360.0;
+
+    if (ok)
+        *ok = true;
+    return phase_degrees;
+}
+
+bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_index, const std::vector<int>& bins)
+{
+    static const double legacy_offsets[] = { 1.15 / 60.0, 1.10 / 40.0, 0.55 / 20.0, 0.20 / 10.0, 0.18 / 5.0 };
+    static const double legacy_tolerances[] = { 0.90, 0.45, 0.25, 0.14, 0.06 };
+
+    if (decimation_index < 0 || decimation_index > 4)
+        decimation_index = 0;
+
+    const double expected_phase_difference_deg = legacy_offsets[decimation_index] * sample_rate_hz / 1.0e6;
+    const double expected_slope_deg_per_bin = -expected_phase_difference_deg / 32.0;
+    const double slope_tolerance_deg_per_bin = legacy_tolerances[decimation_index] / 32.0;
+    const double residual_rms_tolerance_deg = std::max(2.0, legacy_tolerances[decimation_index] * 8.0);
+
+    for (uint32_t iteration = 0; iteration < k_alignment_slope_max_iterations; ++iteration)
+    {
+        lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_FDIV_O_CGEN, 1, true);
+        lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_FDIV_O_CGEN, 0, true);
+
+        if (!AlignRxTSPRobust(k_alignment_tsp_checkpoint_pairs))
+            continue;
+
+        std::vector<double> measured_phase_degrees;
+        measured_phase_degrees.reserve(bins.size());
+        bool all_points_valid = true;
+        for (int bin : bins)
+        {
+            const double tx_frequency_hz = 450.0e6 + sample_rate_hz * static_cast<double>(bin) / 512.0;
+            lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
+            bool valid_point = false;
+            const double measured_phase = MeasurePhaseOffsetDeg(bin, &valid_point);
+            if (!valid_point)
+            {
+                all_points_valid = false;
+                break;
+            }
+            measured_phase_degrees.push_back(measured_phase);
+        }
+
+        if (!all_points_valid)
+            continue;
+
+        const std::vector<double> unwrapped_phase_degrees = unwrap_phase_degrees(measured_phase_degrees);
+
+        double fitted_slope_deg_per_bin = 0.0;
+        double fitted_intercept_deg = 0.0;
+        double fitted_rms_error_deg = 0.0;
+        if (!linear_fit_phase_vs_bin(
+                bins, unwrapped_phase_degrees, &fitted_slope_deg_per_bin, &fitted_intercept_deg, &fitted_rms_error_deg))
+        {
+            continue;
+        }
+
+        const double slope_error_deg_per_bin = std::fabs(fitted_slope_deg_per_bin - expected_slope_deg_per_bin);
+        if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) && (fitted_rms_error_deg <= residual_rms_tolerance_deg))
+            return true;
+    }
+
+    return false;
+}
+
+bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accept_abs_mean_phase_deg)
+{
+    auto* register_backup = lms->BackupRegisterMap();
+
+    lms->SPI_write(0x0020, 0xFFFF, true);
+    lms->SPI_write(0x0113, 0x0046, true);
+    lms->SPI_write(0x0118, 0x418C, true);
+    lms->SPI_write(0x0100, 0x4039, true);
+    lms->SPI_write(0x0101, 0x7801, true);
+    lms->SPI_write(0x0108, 0x318C, true);
+    lms->SPI_write(0x0082, 0x8001, true);
+    lms->SPI_write(0x0200, 0x008D, true);
+    lms->SPI_write(0x0208, 0x01FB, true);
+    lms->SPI_write(0x0400, 0x8081, true);
+    lms->SPI_write(0x040C, 0x01FF, true);
+    lms->SPI_write(0x0404, 0x0006, true);
+    lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+    lms->SPI_write(0x0020, 0xFFFE, true);
+    lms->SPI_write(0x0105, 0x0006, true);
+    lms->SPI_write(0x0100, 0x4038, true);
+    lms->SPI_write(0x0113, 0x007F, true);
+    lms->SPI_write(0x0119, 0x529B, true);
+    uint16_t path_value = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
+    lms->SPI_write(0x010D, path_value == 3 ? 0x018F : path_value == 2 ? 0x0117 : 0x008F, true);
+    lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
+    lms->SPI_write(0x0020, 0xFFFD, true);
+    lms->SPI_write(0x0103, path_value == 2 ? 0x0612 : 0x0A12, true);
+    path_value = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
+    lms->SPI_write(0x010D, path_value == 3 ? 0x018F : path_value == 2 ? 0x0117 : 0x008F, true);
+    lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
+    lms->SPI_write(0x0119, 0x5293, true);
+
+    const double sample_rate_hz = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
+    const double rx_frequency_hz = lms->GetFrequencySX(TRXDir::Rx);
+    lms->SetFrequencySX(TRXDir::Tx, rx_frequency_hz + sample_rate_hz / 16.0);
+
+    bool aligned = false;
+    for (uint32_t iteration = 0; iteration < k_alignment_quadrature_max_iterations; ++iteration)
+    {
+        std::vector<double> measured_phase_degrees;
+        measured_phase_degrees.reserve(bins.size());
+        bool all_points_valid = true;
+        for (int bin : bins)
+        {
+            bool valid_point = false;
+            const double measured_phase = MeasurePhaseOffsetDeg(bin, &valid_point);
+            if (!valid_point)
+            {
+                all_points_valid = false;
+                break;
+            }
+            measured_phase_degrees.push_back(measured_phase);
+        }
+
+        if (all_points_valid)
+        {
+            const std::vector<double> unwrapped_phase_degrees = unwrap_phase_degrees(measured_phase_degrees);
+            const double mean_absolute_phase_degrees = mean_absolute_value(unwrapped_phase_degrees);
+            if (mean_absolute_phase_degrees <= accept_abs_mean_phase_deg)
+            {
+                aligned = true;
+                break;
+            }
+        }
+
+        ResetRxIQGeneratorAlignmentState();
+    }
+
+    if (register_backup)
+        lms->RestoreRegisterMap(register_backup);
+
+    return aligned;
+}
+
+OpStatus TRXLooper::AlignRxPhaseInternal()
+{
+    if (!ShouldAlignRxPhase())
+        return OpStatus::Success;
+
+    const uint16_t mac_backup = lms->SPI_read(0x0020, true);
+    auto* register_backup = lms->BackupRegisterMap();
+
+    lms->SPI_write(0x0020, 0xFFFF, true);
+    lms->SPI_write(0x010C, 0x88C5, true);
+    lms->SPI_write(0x010D, 0x0117, true);
+    lms->SPI_write(0x0113, 0x024A, true);
+    lms->SPI_write(0x0118, 0x418C, true);
+    lms->SPI_write(0x0100, 0x4039, true);
+    lms->SPI_write(0x0101, 0x7801, true);
+    lms->SPI_write(0x0103, 0x0612, true);
+    lms->SPI_write(0x0108, 0x318C, true);
+    lms->SPI_write(0x0082, 0x8001, true);
+    lms->SPI_write(0x0200, 0x008D, true);
+    lms->SPI_write(0x0208, 0x01FB, true);
+    lms->SPI_write(0x0400, 0x8081, true);
+    lms->SPI_write(0x040C, 0x01FF, true);
+    lms->SPI_write(0x0404, 0x0006, true);
+    lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+
+    const double sample_rate_hz = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
+    lms->SetFrequencySX(TRXDir::Rx, 450.0e6);
+
+    int decimation_index = lms->Get_SPI_Reg_bits(LMS7002MCSR::HBD_OVR_RXTSP, true);
+    if (decimation_index > 4)
+        decimation_index = 0;
+
+    const std::vector<int> slope_bins = { 16, 24, 32, 40, 48, 56, 64 };
+    const bool slope_state_ok = SearchRxPhaseSlopeState(sample_rate_hz, decimation_index, slope_bins);
+
+    if (register_backup)
+        lms->RestoreRegisterMap(register_backup);
+
+    lms->SPI_write(0x0020, mac_backup, true);
+
+    if (!slope_state_ok)
+    {
+        lime::warning("Rx phase alignment failed during slope-state search");
+        return OpStatus::Error;
+    }
+
+    const std::vector<int> quadrature_bins = { 24, 32, 40 };
+    const bool quadrature_ok = AlignQuadratureRobust(quadrature_bins, k_alignment_quadrature_accept_mean_deg);
+    if (!quadrature_ok)
+    {
+        lime::warning("Rx phase alignment failed during quadrature-state search");
+        return OpStatus::Error;
+    }
+
     return OpStatus::Success;
 }
 
@@ -297,6 +1040,27 @@ OpStatus TRXLooper::Start()
         // Rx DMA has to be enabled before the stream enable, otherwise some data
         // might be lost in the time frame between stream enable and then dma enable.
         mRxArgs.dma->EnableContinuous(true, readSize, irqPeriod);
+    }
+
+    if (ShouldAlignRxPhase())
+    {
+        status = AlignRxPhaseInternal();
+        if (status != OpStatus::Success)
+        {
+            mRxArgs.dma->Enable(false);
+            fpga->StopStreaming();
+            return status;
+        }
+
+        fpga->StopStreaming();
+        mRxArgs.dma->Enable(false);
+        {
+            const int32_t readSize = mRxArgs.packetSize * mRxArgs.packetsToBatch;
+            constexpr uint8_t irqPeriod{ 4 };
+            mRxArgs.dma->EnableContinuous(true, readSize, irqPeriod);
+        }
+        fpga->ResetPacketCounters(chipId);
+        fpga->ResetTimestamp();
     }
     mRx.terminate.store(false, std::memory_order_relaxed);
     mTx.terminate.store(false, std::memory_order_relaxed);

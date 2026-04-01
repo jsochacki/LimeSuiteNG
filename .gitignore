@@ -30,3 +30,6 @@ docs/LMS_API_Documentation/*
 /out/
 /CMakeSettings.json
 /deps/
+
+# Vim View Files
+.*.view
