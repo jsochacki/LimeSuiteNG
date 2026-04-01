@@ -658,7 +658,8 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
         }
     }
 
-    lime::debug("align: tsp search start");
+    std::fprintf(stderr, "align: tsp search start");
+    std::fflush(stderr);
 
     bool aligned = false;
     for (uint32_t iteration = 0; iteration < k_alignment_tsp_max_iterations; ++iteration)
@@ -684,7 +685,8 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
 
         if (CheckTSPAligned(packet, checkpoint_pairs))
         {
-            lime::debug("align: tsp aligned on iteration %u", iteration);
+            std::fprintf(stderr, "align: tsp aligned on iteration %u", iteration);
+            std::fflush(stderr);
             aligned = true;
             break;
         }
@@ -785,7 +787,7 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
       = std::arg(spectrum_b) * 180.0 / pi - std::arg(spectrum_a) * 180.0 / pi;
    while(phase_degrees < -180.0) phase_degrees += 360.0;
    while(phase_degrees > 180.0) phase_degrees -= 360.0;
-   lime::debug("align: bin=%d phase_deg=%+.6f power_a=%.3e power_b=%.3e "
+   std::fprintf(stderr, "align: bin=%d phase_deg=%+.6f power_a=%.3e power_b=%.3e "
                "payload_bytes=%u samples=%zu",
                bin,
                phase_degrees,
@@ -795,6 +797,7 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
                   ? static_cast<unsigned>(sizeof(packet.data))
                   : packet.GetPayloadSize(),
                channel_a_samples.size());
+   std::fflush(stderr);
    if(ok) *ok = true;
    return phase_degrees;
 }
@@ -812,7 +815,8 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
     const double slope_tolerance_deg_per_bin = legacy_tolerances[decimation_index] / 32.0;
     const double residual_rms_tolerance_deg = std::max(2.0, legacy_tolerances[decimation_index] * 8.0);
 
-    lime::debug("align: slope search start");
+    std::fprintf(stderr, "align: slope search start");
+    std::fflush(stderr);
 
     for (uint32_t iteration = 0; iteration < k_alignment_slope_max_iterations; ++iteration)
     {
@@ -832,13 +836,14 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
            lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
            bool         valid_point    = false;
            const double measured_phase = MeasurePhaseOffsetDeg(bin, &valid_point);
-           lime::debug("align: slope iter=%u bin=%d tx_frequency_hz=%.3f "
+           std::fprintf(stderr, "align: slope iter=%u bin=%d tx_frequency_hz=%.3f "
                        "measured_phase_deg=%+.6f valid=%d",
                        iteration,
                        bin,
                        tx_frequency_hz,
                        measured_phase,
                        valid_point ? 1 : 0);
+           std::fflush(stderr);
            if(!valid_point)
            {
               all_points_valid = false;
@@ -854,12 +859,13 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
 
         for(std::size_t index = 0; index < bins.size(); ++index)
         {
-           lime::debug("align: slope iter=%u bin=%d wrapped_phase_deg=%+.6f "
+           std::fprintf(stderr, "align: slope iter=%u bin=%d wrapped_phase_deg=%+.6f "
                        "unwrapped_phase_deg=%+.6f",
                        iteration,
                        bins[index],
                        measured_phase_degrees[index],
                        unwrapped_phase_degrees[index]);
+           std::fflush(stderr);
         }
 
         double fitted_slope_deg_per_bin = 0.0;
@@ -874,18 +880,20 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         const double slope_error_deg_per_bin =
             std::fabs(fitted_slope_deg_per_bin - expected_slope_deg_per_bin);
 
-        lime::debug(
+        std::fprintf(stderr, 
             "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f",
             iteration,
             fitted_slope_deg_per_bin,
             expected_slope_deg_per_bin,
             slope_error_deg_per_bin,
             fitted_rms_error_deg);
+           std::fflush(stderr);
 
         if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) &&
             (fitted_rms_error_deg <= residual_rms_tolerance_deg))
         {
-            lime::debug("align: slope search accepted on iteration %u", iteration);
+            std::fprintf(stderr, "align: slope search accepted on iteration %u", iteration);
+           std::fflush(stderr);
             return true;
         }
     }
@@ -953,8 +961,9 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
         }
     }
 
-    lime::debug("align: forced MAC back to channel A before quadrature search");
-    lime::debug("align: quadrature search start");
+    std::fprintf(stderr, "align: forced MAC back to channel A before quadrature search");
+    std::fprintf(stderr, "align: quadrature search start");
+    std::fflush(stderr);
 
     bool aligned = false;
     for (uint32_t iteration = 0; iteration < k_alignment_quadrature_max_iterations; ++iteration)
@@ -979,15 +988,17 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
             const std::vector<double> unwrapped_phase_degrees = unwrap_phase_degrees(measured_phase_degrees);
             const double mean_absolute_phase_degrees = mean_absolute_value(unwrapped_phase_degrees);
 
-            lime::debug(
+            std::fprintf(stderr, 
                 "align: quadrature iter=%u mean_absolute_phase_degrees=%.6f accept_abs_mean_phase_deg=%.6f",
                 iteration,
                 mean_absolute_phase_degrees,
                 accept_abs_mean_phase_deg);
+             std::fflush(stderr);
 
             if (mean_absolute_phase_degrees <= accept_abs_mean_phase_deg)
             {
-                lime::debug("align: quadrature accepted on iteration %u", iteration);
+                std::fprintf(stderr, "align: quadrature accepted on iteration %u", iteration);
+                std::fflush(stderr);
                 aligned = true;
                 break;
             }
@@ -1042,7 +1053,8 @@ OpStatus TRXLooper::AlignRxPhaseInternal()
             return mac_restore_status;
         }
     }
-    lime::debug("align: forced MAC back to channel A before slope search");
+    std::fprintf(stderr, "align: forced MAC back to channel A before slope search");
+    std::fflush(stderr);
 
     lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
 
@@ -1053,10 +1065,11 @@ OpStatus TRXLooper::AlignRxPhaseInternal()
     if (decimation_index > 4)
         decimation_index = 0;
 
-    lime::debug(
+    std::fprintf(stderr, 
         "align: slope search sample_rate_hz=%.3f decimation_index=%d",
         sample_rate_hz,
         decimation_index);
+    std::fflush(stderr);
 
     const std::vector<int> slope_bins = { 16, 24, 32, 40, 48, 56, 64 };
     const bool slope_state_ok = SearchRxPhaseSlopeState(sample_rate_hz, decimation_index, slope_bins);
