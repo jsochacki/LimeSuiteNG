@@ -90,6 +90,8 @@ class TRXLooper : public RFStream
     };
 
   private:
+    struct Stream;
+
     bool ShouldAlignRxPhase() const;
     OpStatus AlignRxPhaseInternal();
     bool AlignRxTSPRobust(uint32_t checkpoint_pairs);
