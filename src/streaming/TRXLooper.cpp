@@ -814,6 +814,9 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
             continue;
         }
 
+        const double slope_error_deg_per_bin =
+            std::fabs(fitted_slope_deg_per_bin - expected_slope_deg_per_bin);
+
         lime::debug(
             "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f",
             iteration,
@@ -856,6 +859,17 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
     lms->SPI_write(0x0100, 0x4038, true);
     lms->SPI_write(0x0113, 0x007F, true);
     lms->SPI_write(0x0119, 0x529B, true);
+
+   {
+       const OpStatus status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+       if (status != OpStatus::Success)
+       {
+           if (register_backup)
+               lms->RestoreRegisterMap(register_backup);
+           return false;
+       }
+   }
+
     uint16_t path_value = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
     lms->SPI_write(0x010D, path_value == 3 ? 0x018F : path_value == 2 ? 0x0117 : 0x008F, true);
     lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
