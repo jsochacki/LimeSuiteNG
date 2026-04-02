@@ -715,12 +715,12 @@ bool TRXLooper::CaptureFreshAlignmentPacket(
 
         if (state.transfersCompleted > baseline_completed)
         {
-            std::fprintf(
-                stderr,
-                "align: capture got completion completed=%" PRIu64 " buffer_index=%u\n",
-                state.transfersCompleted,
-                static_cast<unsigned>(buffer_index));
-            std::fflush(stderr);
+            //std::fprintf(
+            //    stderr,
+            //    "align: capture got completion completed=%" PRIu64 " buffer_index=%u\n",
+            //    state.transfersCompleted,
+            //    static_cast<unsigned>(buffer_index));
+            //std::fflush(stderr);
 
             mRxArgs.dma->BufferOwnership(
                 buffer_index,
@@ -969,8 +969,8 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
     }
 
 
-    std::fprintf(stderr, "align: tsp search start\n");
-    std::fflush(stderr);
+    //std::fprintf(stderr, "align: tsp search start\n");
+    //std::fflush(stderr);
 
     bool aligned = false;
     for (uint32_t iteration = 0; iteration < k_alignment_tsp_max_iterations; ++iteration)
@@ -990,8 +990,8 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
 
         if (CheckTSPAligned(packet, checkpoint_pairs))
         {
-            std::fprintf(stderr, "align: tsp aligned on iteration %u\n", iteration);
-            std::fflush(stderr);
+            //std::fprintf(stderr, "align: tsp aligned on iteration %u\n", iteration);
+            //std::fflush(stderr);
             aligned = true;
             break;
         }
