@@ -1016,32 +1016,51 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
     return aligned;
 }
 
-void TRXLooper::ResetRxIQGeneratorAlignmentState()
+void TRXLooper::ResetRxIQGeneratorAlignmentState(void)
 {
-   const OpStatus channel_status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
-   if (channel_status != OpStatus::Success)
-   {
-       return;
-   }
+    // Backup the original MAC to restore at the very end of the routine
+    const uint16_t caller_mac = lms->SPI_read(0x0020, true);
 
-    uint16_t reg20 = lms->SPI_read(0x0020, true);
-    uint16_t reg10c = 0;
-    uint16_t reg11c = lms->SPI_read(0x011C, true);
-
+    const LMS7002M::Channel channels_to_reset[2] =
     {
-        LMS7002M::ChannelScope channel_scope(lms, LMS7002M::Channel::ChA);
-        reg10c = lms->SPI_read(0x010C, true);
+        LMS7002M::Channel::ChA,
+        LMS7002M::Channel::ChB
+    };
+
+    for (LMS7002M::Channel channel_value : channels_to_reset)
+    {
+        const OpStatus channel_status = lms->SetActiveChannel(channel_value);
+        if (channel_status != OpStatus::Success)
+        {
+            // Emergency restore if channel selection fails
+            lms->SPI_write(0x0020, caller_mac, true);
+            return;
+        }
+
+        // Local backup for register values that require bitwise modification
+        const uint16_t register_0020_backup = lms->SPI_read(0x0020, true);
+        const uint16_t register_010c_backup = lms->SPI_read(0x010C, true);
+        const uint16_t register_011c_backup = lms->SPI_read(0x011C, true);
+
+        // Perform the toggling sequence to reset the IQ generator state machine
+        lms->SPI_write(0x0020, 0xFFFD, true);
+        lms->SPI_write(0x011C, static_cast<uint16_t>(register_011c_backup | 0x0010), true);
+
+        lms->SPI_write(0x0020, 0xFFFF, true);
+        lms->SPI_write(0x0124, 0x001F, true);
+
+        lms->SPI_write(0x010C, static_cast<uint16_t>(register_010c_backup | 0x0008), true);
+        lms->SPI_write(0x010C, register_010c_backup, true);
+
+        lms->SPI_write(0x0020, 0xFFFD, true);
+        lms->SPI_write(0x011C, register_011c_backup, true);
+
+        // Restore the local MAC for this channel iteration
+        lms->SPI_write(0x0020, register_0020_backup, true);
     }
 
-    lms->SPI_write(0x0020, 0xFFFD, true);
-    lms->SPI_write(0x011C, static_cast<uint16_t>(reg11c | 0x0010), true);
-    lms->SPI_write(0x0020, 0xFFFF, true);
-    lms->SPI_write(0x0124, 0x001F, true);
-    lms->SPI_write(0x010C, static_cast<uint16_t>(reg10c | 0x0008), true);
-    lms->SPI_write(0x010C, reg10c, true);
-    lms->SPI_write(0x0020, 0xFFFD, true);
-    lms->SPI_write(0x011C, reg11c, true);
-    lms->SPI_write(0x0020, reg20, true);
+    // Final restoration of the MAC present before the function call
+    lms->SPI_write(0x0020, caller_mac, true);
 }
 
 alignment_bin_result TRXLooper::MeasureAlignmentBin(int bin)
@@ -1317,35 +1336,39 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
 
 bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accept_abs_mean_phase_deg)
 {
-   static constexpr double k_alignment_quadrature_power_keep_within_db = 12.0;
-   static constexpr std::size_t k_alignment_quadrature_min_valid_bins  = 2;
-   const double k_alignment_quadrature_mean_abs_phase_deg = accept_abs_mean_phase_deg;
-   static constexpr double k_alignment_quadrature_max_abs_phase_deg    = 20.0;
+    // Search constraints and constants
+    static constexpr double k_alignment_quadrature_power_keep_within_db = 12.0;
+    static constexpr std::size_t k_alignment_quadrature_min_valid_bins = 2;
+    const double k_alignment_quadrature_mean_abs_phase_deg = accept_abs_mean_phase_deg;
+    static constexpr double k_alignment_quadrature_max_abs_phase_deg = 20.0;
 
-   auto*                   register_backup = lms->BackupRegisterMap();
+    // Protocol: Backup entire register map and current MAC
+    const uint16_t caller_mac = lms->SPI_read(0x0020, true);
+    auto* register_backup = lms->BackupRegisterMap();
 
-   lms->SPI_write(0x0020, 0xFFFF, true);
-   lms->SPI_write(0x0113, 0x0046, true);
-   lms->SPI_write(0x0118, 0x418C, true);
-   lms->SPI_write(0x0100, 0x4039, true);
-   lms->SPI_write(0x0101, 0x7801, true);
-   lms->SPI_write(0x0108, 0x318C, true);
-   lms->SPI_write(0x0082, 0x8001, true);
-   lms->SPI_write(0x0200, 0x008D, true);
-   lms->SPI_write(0x0208, 0x01FB, true);
-   lms->SPI_write(0x0400, 0x8081, true);
-   lms->SPI_write(0x040C, 0x01FF, true);
-   lms->SPI_write(0x0404, 0x0006, true);
+    // Configure temporary alignment hardware state
+    lms->SPI_write(0x0020, 0xFFFF, true);
+    lms->SPI_write(0x0113, 0x0046, true);
+    lms->SPI_write(0x0118, 0x418C, true);
+    lms->SPI_write(0x0100, 0x4039, true);
+    lms->SPI_write(0x0101, 0x7801, true);
+    lms->SPI_write(0x0108, 0x318C, true);
+    lms->SPI_write(0x0082, 0x8001, true);
+    lms->SPI_write(0x0200, 0x008D, true);
+    lms->SPI_write(0x0208, 0x01FB, true);
+    lms->SPI_write(0x0400, 0x8081, true);
+    lms->SPI_write(0x040C, 0x01FF, true);
+    lms->SPI_write(0x0404, 0x0006, true);
 
-   {
-       const OpStatus status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
-       if (status != OpStatus::Success)
-       {
-           if (register_backup)
-               lms->RestoreRegisterMap(register_backup);
-           return false;
-       }
-   }
+    {
+        const OpStatus status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+        if (status != OpStatus::Success)
+        {
+            if (register_backup) lms->RestoreRegisterMap(register_backup);
+            lms->SPI_write(0x0020, caller_mac, true);
+            return false;
+        }
+    }
 
     lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
     lms->SPI_write(0x0020, 0xFFFE, true);
@@ -1354,12 +1377,12 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
     lms->SPI_write(0x0113, 0x007F, true);
     lms->SPI_write(0x0119, 0x529B, true);
 
-
     uint16_t path_value = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
     lms->SPI_write(0x010D, path_value == 3 ? 0x018F : path_value == 2 ? 0x0117 : 0x008F, true);
     lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
     lms->SPI_write(0x0020, 0xFFFD, true);
     lms->SPI_write(0x0103, path_value == 2 ? 0x0612 : 0x0A12, true);
+    
     path_value = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
     lms->SPI_write(0x010D, path_value == 3 ? 0x018F : path_value == 2 ? 0x0117 : 0x008F, true);
     lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
@@ -1373,80 +1396,84 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
         const OpStatus mac_restore_status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
         if (mac_restore_status != OpStatus::Success)
         {
-            if (register_backup)
-                lms->RestoreRegisterMap(register_backup);
+            if (register_backup) lms->RestoreRegisterMap(register_backup);
+            lms->SPI_write(0x0020, caller_mac, true);
             return false;
         }
     }
 
-    std::fprintf(stderr, "align: forced MAC back to channel A before quadrature search\n");
-    std::fprintf(stderr, "align: quadrature search start\n");
-    std::fflush(stderr);
+    std::fprintf(stderr, "align: quadrature search initialization complete\n");
 
-    bool aligned = false;
+    bool aligned_flag = false;
     for (uint32_t iteration = 0; iteration < k_alignment_quadrature_max_iterations; ++iteration)
     {
-       std::vector<alignment_bin_result> measured_bins;
-       measured_bins.reserve(bins.size());
-       for(int bin : bins)
-       {
-          const alignment_bin_result result = MeasureAlignmentBin(bin);
-          if(!result.valid) continue;
-          measured_bins.push_back(result);
-       }
-       const std::vector<alignment_bin_result> filtered_bins
-          = filter_alignment_bins_by_relative_power(
-             measured_bins,
-             k_alignment_quadrature_power_keep_within_db);
-       if(filtered_bins.size() < k_alignment_quadrature_min_valid_bins)
-       {
-          ResetRxIQGeneratorAlignmentState();
-          continue;
-       }
-       std::vector<double> filtered_phase_degrees;
-       filtered_phase_degrees.reserve(filtered_bins.size());
-       for(const alignment_bin_result& result : filtered_bins)
-          filtered_phase_degrees.push_back(result.phase_degrees);
-       const std::vector<double> unwrapped_phase_degrees
-          = unwrap_phase_degrees(filtered_phase_degrees);
-       const double mean_absolute_phase_degrees
-          = mean_absolute_value(unwrapped_phase_degrees);
-       const double maximum_absolute_phase_degrees
-          = max_absolute_value(unwrapped_phase_degrees);
-       std::fprintf(stderr,
-                    "align: quadrature iter=%u mean_abs_phase_deg=%.6f "
-                    "max_abs_phase_deg=%.6f valid_bins=%zu\n",
-                    iteration,
-                    mean_absolute_phase_degrees,
-                    maximum_absolute_phase_degrees,
-                    filtered_bins.size());
-       std::fflush(stderr);
-       if((mean_absolute_phase_degrees
-           <= k_alignment_quadrature_mean_abs_phase_deg)
-          && (maximum_absolute_phase_degrees
-              <= k_alignment_quadrature_max_abs_phase_deg))
-       {
-          std::fprintf(stderr,
-                       "align: quadrature accepted on iteration %u\n",
-                       iteration);
-          std::fflush(stderr);
-          aligned = true;
-          break;
-       }
+        std::vector<alignment_bin_result> measured_bins;
+        measured_bins.reserve(bins.size());
 
-       ResetRxIQGeneratorAlignmentState();
+        for (int bin : bins)
+        {
+            const alignment_bin_result bin_result = MeasureAlignmentBin(bin);
+            if (!bin_result.valid)
+            {
+                continue;
+            }
+            measured_bins.push_back(bin_result);
+        }
 
+        const std::vector<alignment_bin_result> filtered_bins =
+            filter_alignment_bins_by_relative_power(
+                measured_bins,
+                k_alignment_quadrature_power_keep_within_db);
+
+        if (filtered_bins.size() < k_alignment_quadrature_min_valid_bins)
+        {
+            ResetRxIQGeneratorAlignmentState();
+            continue;
+        }
+
+        std::vector<double> filtered_phase_degrees;
+        filtered_phase_degrees.reserve(filtered_bins.size());
+
+        for (const alignment_bin_result& result : filtered_bins)
+        {
+            filtered_phase_degrees.push_back(result.phase_degrees);
+        }
+
+        const std::vector<double> unwrapped_phase_degrees = unwrap_phase_degrees(filtered_phase_degrees);
+        const double mean_absolute_phase_degrees = mean_absolute_value(unwrapped_phase_degrees);
+        const double maximum_absolute_phase_degrees = max_absolute_value(unwrapped_phase_degrees);
+
+        std::fprintf(stderr,
+                     "align: iter=%u mean_abs=%.4f max_abs=%.4f bins=%zu\n",
+                     iteration,
+                     mean_absolute_phase_degrees,
+                     maximum_absolute_phase_degrees,
+                     filtered_bins.size());
+
+        if ((mean_absolute_phase_degrees <= k_alignment_quadrature_mean_abs_phase_deg) &&
+            (maximum_absolute_phase_degrees <= k_alignment_quadrature_max_abs_phase_deg))
+        {
+            std::fprintf(stderr, "align: quadrature converged at iteration %u\n", iteration);
+            aligned_flag = true;
+            break;
+        }
+
+        ResetRxIQGeneratorAlignmentState();
     }
 
-    if (!aligned)
+    if (!aligned_flag)
     {
-        lime::warning("align: quadrature search exhausted without success");
+        lime::warning("align: quadrature alignment failed to converge");
     }
 
+    // Comprehensive State Restoration
     if (register_backup)
+    {
         lms->RestoreRegisterMap(register_backup);
+    }
+    lms->SPI_write(0x0020, caller_mac, true);
 
-    return aligned;
+    return aligned_flag;
 }
 
 OpStatus TRXLooper::AlignRxPhaseInternal()

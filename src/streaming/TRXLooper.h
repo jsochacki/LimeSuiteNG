@@ -117,7 +117,7 @@ class TRXLooper : public RFStream
     double MeasurePhaseOffsetDeg(int bin, bool* ok);
     bool SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_index, const std::vector<int>& bins);
     bool AlignQuadratureRobust(const std::vector<int>& bins, double accept_abs_mean_phase_deg);
-    void ResetRxIQGeneratorAlignmentState();
+    void ResetRxIQGeneratorAlignmentState(void);
     OpStatus Flush_transport_state_for_alignment(void);
     void Recycle_stream_packets_for_alignment(Stream& stream_state);
     OpStatus Discard_initial_rx_dma_transfers_for_alignment(uint32_t number_of_transfers_to_discard, uint8_t irq_period);
