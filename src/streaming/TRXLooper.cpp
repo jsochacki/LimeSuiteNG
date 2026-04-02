@@ -151,6 +151,11 @@ bool deinterleave_alignment_packet(const StreamConfig& config,
 
     const uint16_t payload_size_bytes = packet.GetPayloadSize() == 0 ? sizeof(packet.data) : packet.GetPayloadSize();
     const int samples_deinterleaved = Deinterleave(destinations, packet.data, payload_size_bytes, conversion);
+
+    std::fprintf(stderr, "align: samples_deinterleaved=%d payload_bytes=%u\n",
+        samples_deinterleaved,
+        payload_size_bytes);
+    std::fflush(stderr);
     //512 sized packet but header is 16 bits so only 510 samples
     // TODO maybe just make 510
     if (samples_deinterleaved < 256)
@@ -747,6 +752,8 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
     if (ok)
         *ok = false;
 
+    std::fprintf(stderr, "align: prepare_status=%d\n", static_cast<int>(prepare_status));
+    std::fflush(stderr);
     const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
     if (prepare_status != OpStatus::Success)
         return 0.0;
@@ -757,11 +764,19 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
     fpga->StopStreaming();
     mRxArgs.dma->Enable(false);
 
+    std::fprintf(stderr, "align: have_packet=0\n");
+    std::fflush(stderr);
     if (!have_packet)
         return 0.0;
 
     std::vector<complex16_t> channel_a_samples;
     std::vector<complex16_t> channel_b_samples;
+
+    std::fprintf(stderr, "align: deinterleave failed payload_bytes=%u\n",
+    packet.GetPayloadSize() == 0
+        ? static_cast<unsigned>(sizeof(packet.data))
+        : packet.GetPayloadSize());
+    std::fflush(stderr);
     if (!deinterleave_alignment_packet(mConfig, packet, &channel_a_samples, &channel_b_samples))
         return 0.0;
 
