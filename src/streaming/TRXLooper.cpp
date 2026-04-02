@@ -1280,14 +1280,27 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         const double slope_error_deg_per_bin =
             std::fabs(fitted_slope_deg_per_bin - expected_slope_deg_per_bin);
 
-        std::fprintf(stderr, 
-            "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f\n",
-            iteration,
-            fitted_slope_deg_per_bin,
-            expected_slope_deg_per_bin,
-            slope_error_deg_per_bin,
-            fitted_rms_error_deg);
-           std::fflush(stderr);
+         std::fprintf(
+             stderr,
+             "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f phases_deg=",
+             iteration,
+             fitted_slope_deg_per_bin,
+             expected_slope_deg_per_bin,
+             slope_error_deg_per_bin,
+             fitted_rms_error_deg);
+
+         for (std::size_t phase_index = 0; phase_index < filtered_bin_indices.size(); ++phase_index)
+         {
+             std::fprintf(
+                 stderr,
+                 "%s%d:%+.6f",
+                 phase_index == 0 ? "" : ",",
+                 filtered_bin_indices[phase_index],
+                 unwrapped_phase_degrees[phase_index]);
+         }
+
+         std::fprintf(stderr, "\n");
+         std::fflush(stderr);
 
         if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) &&
             (fitted_rms_error_deg <= residual_rms_tolerance_deg))
@@ -1420,6 +1433,8 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
           aligned = true;
           break;
        }
+
+       ResetRxIQGeneratorAlignmentState();
 
     }
 
