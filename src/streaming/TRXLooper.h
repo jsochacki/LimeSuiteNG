@@ -104,6 +104,7 @@ class TRXLooper : public RFStream
     OpStatus Flush_transport_state_for_alignment(void);
     void Recycle_stream_packets_for_alignment(Stream& stream_state);
     OpStatus Discard_initial_rx_dma_transfers_for_alignment(uint32_t number_of_transfers_to_discard, uint8_t irq_period);
+    OpStatus Prepare_rx_transport_for_alignment_capture(void);
     OpStatus Prepare_rx_transport_for_alignment_capture(uint32_t number_of_transfers_to_discard);
 
     OpStatus RxSetup();

@@ -615,37 +615,35 @@ bool TRXLooper::ShouldAlignRxPhase() const
 
 bool TRXLooper::CaptureAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout)
 {
-   std::fprintf(stderr, "align: entered CaptureAlignmentPacket\n");
-   std::fflush(stderr);
-
-    if (!packet)
+    if (packet == nullptr)
         return false;
-
     const auto start_time = std::chrono::steady_clock::now();
     const auto buffer_count = mRxArgs.buffers.size();
-    uint64_t last_completed = mRxArgs.dma->GetCounters().transfersCompleted;
-
+    const IDMA::State initial_state = mRxArgs.dma->GetCounters();
+    uint64_t last_completed = initial_state.transfersCompleted;
+    std::fprintf(stderr, "align: capture start completed=%" PRIu64 "\n", last_completed);
+    std::fflush(stderr);
     while ((std::chrono::steady_clock::now() - start_time) < timeout)
     {
-        if (mRxArgs.dma->Wait() != OpStatus::Success)
-            continue;
-
-        std::fprintf(stderr, "align: dma wait returned, checking counters\n");
-        std::fflush(stderr);
-
-        const auto state = mRxArgs.dma->GetCounters();
-        if (state.transfersCompleted == last_completed)
-            continue;
-
-        last_completed = state.transfersCompleted;
-        const uint64_t completed_index = last_completed - 1;
-        const uint16_t buffer_index = static_cast<uint16_t>(completed_index % buffer_count);
-        mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
-        std::memcpy(packet, mRxArgs.buffers.at(buffer_index), sizeof(FPGA_RxDataPacket));
-        mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
-        return true;
+        const IDMA::State state = mRxArgs.dma->GetCounters();
+        if (state.transfersCompleted != last_completed)
+        {
+            const uint64_t completed_index = state.transfersCompleted - 1;
+            const uint16_t buffer_index = static_cast<uint16_t>(completed_index % buffer_count);
+            std::fprintf(stderr,
+                "align: capture got completion completed=%" PRIu64 " buffer_index=%u\n",
+                state.transfersCompleted,
+                static_cast<unsigned>(buffer_index));
+            std::fflush(stderr);
+            mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
+            std::memcpy(packet, mRxArgs.buffers.at(buffer_index), sizeof(FPGA_RxDataPacket));
+            mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
-
+    std::fprintf(stderr, "align: capture timeout no completion\n");
+    std::fflush(stderr);
     return false;
 }
 
