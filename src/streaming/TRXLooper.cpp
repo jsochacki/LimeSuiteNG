@@ -549,7 +549,7 @@ OpStatus TRXLooper::Prepare_rx_transport_for_alignment_capture(void)
     if (status != OpStatus::Success)
         return status;
 
-    const uint32_t read_size_bytes = sizeof(FPGA_RxDataPacket);
+    const uint32_t read_size_bytes = mRxArgs.packetSize;
     constexpr uint8_t irq_period = 1;
 
     status = mRxArgs.dma->EnableContinuous(true, read_size_bytes, irq_period);
@@ -636,7 +636,8 @@ bool TRXLooper::CaptureAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::m
                 static_cast<unsigned>(buffer_index));
             std::fflush(stderr);
             mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
-            std::memcpy(packet, mRxArgs.buffers.at(buffer_index), sizeof(FPGA_RxDataPacket));
+            std::memset(packet, 0, sizeof(FPGA_RxDataPacket));
+            std::memcpy(packet, mRxArgs.buffers.at(buffer_index), mRxArgs.packetSize);
             mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
             return true;
         }
