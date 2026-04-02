@@ -701,11 +701,11 @@ bool TRXLooper::CaptureFreshAlignmentPacket(
 
     fpga->StartStreaming();
 
-    std::fprintf(
-        stderr,
-        "align: capture baseline completed=%" PRIu64 "\n",
-        baseline_completed);
-    std::fflush(stderr);
+    //std::fprintf(
+    //    stderr,
+    //    "align: capture baseline completed=%" PRIu64 "\n",
+    //    baseline_completed);
+    //std::fflush(stderr);
 
     const auto start_time = std::chrono::steady_clock::now();
 
