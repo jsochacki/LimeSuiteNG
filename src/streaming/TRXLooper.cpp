@@ -427,7 +427,7 @@ OpStatus TRXLooper::Flush_transport_state_for_alignment(void)
     if (mRxArgs.dma)
     {
         for (uint16_t buffer_index = 0; buffer_index < mRxArgs.buffers.size(); ++buffer_index)
-            mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
+            mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
     }
 
     if (mTxArgs.dma)
@@ -613,6 +613,77 @@ bool TRXLooper::ShouldAlignRxPhase() const
     return mConfig.alignPhase && (rx_it->second.size() == 2);
 }
 
+TRXLooper::CaptureFreshAlignmentPacket(FPGA_RxDataPacket*        packet,
+                                       std::chrono::milliseconds timeout)
+{
+   if(packet == nullptr) return false;
+   OpStatus status = Flush_transport_state_for_alignment();
+   if(status != OpStatus::Success) return false;
+   status = mRxArgs.dma->Initialize();
+   if(status != OpStatus::Success) return false;
+   for(uint16_t buffer_index = 0; buffer_index < mRxArgs.buffers.size();
+       ++buffer_index)
+   {
+      mRxArgs.dma->BufferOwnership(buffer_index,
+                                   DataTransferDirection::HostToDevice);
+   }
+   const IDMA::State baseline_state     = mRxArgs.dma->GetCounters();
+   const uint64_t    baseline_completed = baseline_state.transfersCompleted;
+   const uint32_t    read_size_bytes    = mRxArgs.packetSize;
+   constexpr uint8_t irq_period         = 1;
+   status = mRxArgs.dma->EnableContinuous(true, read_size_bytes, irq_period);
+   if(status != OpStatus::Success) return false;
+   status = fpga->SelectModule(chipId);
+   if(status != OpStatus::Success)
+   {
+      mRxArgs.dma->Enable(false);
+      return false;
+   }
+   fpga->StartStreaming();
+   std::fprintf(stderr,
+                "align: capture baseline completed=%" PRIu64 "\n",
+                baseline_completed);
+   std::fflush(stderr);
+   const auto start_time   = std::chrono::steady_clock::now();
+   const auto buffer_count = mRxArgs.buffers.size();
+   while((std::chrono::steady_clock::now() - start_time) < timeout)
+   {
+      const IDMA::State state = mRxArgs.dma->GetCounters();
+      if(state.transfersCompleted > baseline_completed)
+      {
+         const uint64_t completed_index = state.transfersCompleted - 1;
+         const uint16_t buffer_index
+            = static_cast<uint16_t>(completed_index % buffer_count);
+         std::fprintf(stderr,
+                      "align: capture got completion completed=%" PRIu64 " buf"
+                                                                         "fer_"
+                                                                         "inde"
+                                                                         "x=%"
+                                                                         "u\n",
+                      state.transfersCompleted,
+                      static_cast<unsigned>(buffer_index));
+         std::fflush(stderr);
+         mRxArgs.dma->BufferOwnership(buffer_index,
+                                      DataTransferDirection::DeviceToHost);
+         std::memset(packet, 0, sizeof(FPGA_RxDataPacket));
+         std::memcpy(packet,
+                     mRxArgs.buffers.at(buffer_index),
+                     mRxArgs.packetSize);
+         mRxArgs.dma->BufferOwnership(buffer_index,
+                                      DataTransferDirection::HostToDevice);
+         fpga->StopStreaming();
+         mRxArgs.dma->Enable(false);
+         return true;
+      }
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+   }
+   std::fprintf(stderr, "align: capture timeout no completion\n");
+   std::fflush(stderr);
+   fpga->StopStreaming();
+   mRxArgs.dma->Enable(false);
+   return false;
+}
+
 bool TRXLooper::CaptureAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout)
 {
     if (packet == nullptr)
@@ -697,6 +768,7 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
         }
     }
 
+
     std::fprintf(stderr, "align: tsp search start\n");
     std::fflush(stderr);
 
@@ -710,18 +782,11 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
         }
 
         //const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
-        const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture();
-        if (prepare_status != OpStatus::Success)
-            continue;
-
         FPGA_RxDataPacket packet;
-        const bool have_packet = CaptureAlignmentPacket(&packet, std::chrono::milliseconds(150));
-
-        fpga->StopStreaming();
-        mRxArgs.dma->Enable(false);
-
-        if (!have_packet)
-            continue;
+        const bool        have_packet
+           = CaptureFreshAlignmentPacket(&packet,
+                                         std::chrono::milliseconds(150));
+        if(!have_packet) continue;
 
         if (CheckTSPAligned(packet, checkpoint_pairs))
         {
@@ -779,76 +844,82 @@ void TRXLooper::ResetRxIQGeneratorAlignmentState()
     lms->SPI_write(0x0020, reg20, true);
 }
 
-double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
+double
+TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
 {
-    if (ok)
-        *ok = false;
-    const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture();
-    std::fprintf(stderr, "align: prepare_status=%d\n", static_cast<int>(prepare_status));
-    std::fflush(stderr);
-    if (prepare_status != OpStatus::Success)
-    {
-        std::fprintf(stderr, "align: prepare failed\n");
-        std::fflush(stderr);
-        return 0.0;
-    }
-    FPGA_RxDataPacket packet;
-    const bool have_packet = CaptureAlignmentPacket(&packet, std::chrono::milliseconds(150));
-    fpga->StopStreaming();
-    mRxArgs.dma->Enable(false);
-    std::fprintf(stderr, "align: have_packet=%d\n", have_packet ? 1 : 0);
-    std::fflush(stderr);
-    if (!have_packet)
-    {
-        std::fprintf(stderr, "align: no packet captured\n");
-        std::fflush(stderr);
-        return 0.0;
-    }
-    std::vector<complex16_t> channel_a_samples;
-    std::vector<complex16_t> channel_b_samples;
-    const bool deinterleave_ok = deinterleave_alignment_packet(mConfig, packet, &channel_a_samples, &channel_b_samples);
-    std::fprintf(stderr,
-        "align: deinterleave_ok=%d payload_bytes=%u\n",
-        deinterleave_ok ? 1 : 0,
-        packet.GetPayloadSize() == 0 ? static_cast<unsigned>(sizeof(packet.data)) : packet.GetPayloadSize());
-    std::fflush(stderr);
-    if (!deinterleave_ok)
-        return 0.0;
-    static constexpr int dft_length = 512;
-    const int sample_count = std::min<int>(dft_length, static_cast<int>(channel_a_samples.size()));
-    const complex64f_t imaginary_unit(0.0, 1.0);
-    const double pi = std::acos(-1.0);
-    complex64f_t spectrum_a(0.0, 0.0);
-    complex64f_t spectrum_b(0.0, 0.0);
-    for (int sample_index = 0; sample_index < sample_count; ++sample_index)
-    {
-        const complex64f_t sample_a(channel_a_samples[sample_index].real(), channel_a_samples[sample_index].imag());
-        const complex64f_t sample_b(channel_b_samples[sample_index].real(), channel_b_samples[sample_index].imag());
-        const complex64f_t phasor =
-            std::exp((-2.0 * imaginary_unit * pi * static_cast<double>(bin) * static_cast<double>(sample_index)) /
-                     static_cast<double>(dft_length));
-        spectrum_a += sample_a * phasor;
-        spectrum_b += sample_b * phasor;
-    }
-    const double power_a = compute_single_bin_power(channel_a_samples, bin, sample_count, dft_length);
-    const double power_b = compute_single_bin_power(channel_b_samples, bin, sample_count, dft_length);
-    double phase_degrees = std::arg(spectrum_b) * 180.0 / pi - std::arg(spectrum_a) * 180.0 / pi;
-    while (phase_degrees < -180.0)
-        phase_degrees += 360.0;
-    while (phase_degrees > 180.0)
-        phase_degrees -= 360.0;
-    std::fprintf(stderr,
-        "align: bin=%d phase_deg=%+.6f power_a=%.3e power_b=%.3e payload_bytes=%u samples=%d\n",
-        bin,
-        phase_degrees,
-        power_a,
-        power_b,
-        packet.GetPayloadSize() == 0 ? static_cast<unsigned>(sizeof(packet.data)) : packet.GetPayloadSize(),
-        sample_count);
-    std::fflush(stderr);
-    if (ok)
-        *ok = true;
-    return phase_degrees;
+   if(ok) *ok = false;
+   FPGA_RxDataPacket packet;
+   const bool        have_packet
+      = CaptureFreshAlignmentPacket(&packet, std::chrono::milliseconds(150));
+   std::fprintf(stderr, "align: have_packet=%d\n", have_packet ? 1 : 0);
+   std::fflush(stderr);
+   if(!have_packet)
+   {
+      std::fprintf(stderr, "align: no packet captured\n");
+      std::fflush(stderr);
+      return 0.0;
+   }
+   std::vector<complex16_t> channel_a_samples;
+   std::vector<complex16_t> channel_b_samples;
+   const bool               deinterleave_ok
+      = deinterleave_alignment_packet(mConfig,
+                                      packet,
+                                      &channel_a_samples,
+                                      &channel_b_samples);
+   std::fprintf(stderr,
+                "align: deinterleave_ok=%d payload_bytes=%u\n",
+                deinterleave_ok ? 1 : 0,
+                packet.GetPayloadSize() == 0
+                   ? static_cast<unsigned>(sizeof(packet.data))
+                   : packet.GetPayloadSize());
+   std::fflush(stderr);
+   if(!deinterleave_ok) return 0.0;
+   static constexpr int dft_length = 512;
+   const int            sample_count
+      = std::min<int>(dft_length, static_cast<int>(channel_a_samples.size()));
+   const complex64f_t imaginary_unit(0.0, 1.0);
+   const double       pi = std::acos(-1.0);
+   complex64f_t       spectrum_a(0.0, 0.0);
+   complex64f_t       spectrum_b(0.0, 0.0);
+   for(int sample_index = 0; sample_index < sample_count; ++sample_index)
+   {
+      const complex64f_t sample_a(channel_a_samples[sample_index].real(),
+                                  channel_a_samples[sample_index].imag());
+      const complex64f_t sample_b(channel_b_samples[sample_index].real(),
+                                  channel_b_samples[sample_index].imag());
+      const complex64f_t phasor
+         = std::exp((-2.0 * imaginary_unit * pi * static_cast<double>(bin)
+                     * static_cast<double>(sample_index))
+                    / static_cast<double>(dft_length));
+      spectrum_a += sample_a * phasor;
+      spectrum_b += sample_b * phasor;
+   }
+   const double power_a = compute_single_bin_power(channel_a_samples,
+                                                   bin,
+                                                   sample_count,
+                                                   dft_length);
+   const double power_b = compute_single_bin_power(channel_b_samples,
+                                                   bin,
+                                                   sample_count,
+                                                   dft_length);
+   double       phase_degrees
+      = std::arg(spectrum_b) * 180.0 / pi - std::arg(spectrum_a) * 180.0 / pi;
+   while(phase_degrees < -180.0) phase_degrees += 360.0;
+   while(phase_degrees > 180.0) phase_degrees -= 360.0;
+   std::fprintf(stderr,
+                "align: bin=%d phase_deg=%+.6f power_a=%.3e power_b=%.3e "
+                "payload_bytes=%u samples=%d\n",
+                bin,
+                phase_degrees,
+                power_a,
+                power_b,
+                packet.GetPayloadSize() == 0
+                   ? static_cast<unsigned>(sizeof(packet.data))
+                   : packet.GetPayloadSize(),
+                sample_count);
+   std::fflush(stderr);
+   if(ok) *ok = true;
+   return phase_degrees;
 }
 
 //double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
