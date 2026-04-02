@@ -21,6 +21,23 @@ class IDMA;
 class LMS7002M;
 struct FPGA_RxDataPacket;
 
+struct alignment_bin_result
+{
+   int    bin;
+   bool   valid;
+   double phase_degrees;
+   double power_a;
+   double power_b;
+   alignment_bin_result(void)
+      : bin(0)
+      , valid(false)
+      , phase_degrees(0.0)
+      , power_a(0.0)
+      , power_b(0.0)
+   {}
+};
+
+
 /** @brief Class responsible for receiving and transmitting continuous sample data */
 class TRXLooper : public RFStream
 {
@@ -92,22 +109,6 @@ class TRXLooper : public RFStream
   private:
     struct Stream;
 
-    struct alignment_bin_result
-    {
-       int    bin;
-       bool   valid;
-       double phase_degrees;
-       double power_a;
-       double power_b;
-       alignment_bin_result(void)
-          : bin(0)
-          , valid(false)
-          , phase_degrees(0.0)
-          , power_a(0.0)
-          , power_b(0.0)
-       {}
-    };
-
     bool ShouldAlignRxPhase() const;
     OpStatus AlignRxPhaseInternal();
     bool AlignRxTSPRobust(uint32_t checkpoint_pairs);
@@ -123,6 +124,11 @@ class TRXLooper : public RFStream
     OpStatus Prepare_rx_transport_for_alignment_capture(void);
     OpStatus Prepare_rx_transport_for_alignment_capture(uint32_t number_of_transfers_to_discard);
     bool CaptureFreshAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout);
+    bool CaptureFreshAlignmentSamples(
+        std::vector<complex16_t>* channel_a_samples,
+        std::vector<complex16_t>* channel_b_samples,
+        int required_sample_count,
+        std::chrono::milliseconds timeout_per_packet);
     alignment_bin_result MeasureAlignmentBin(int bin);
 
 

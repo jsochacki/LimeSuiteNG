@@ -157,7 +157,6 @@ bool deinterleave_alignment_packet(const StreamConfig& config,
         payload_size_bytes);
     std::fflush(stderr);
     //512 sized packet but header is 16 bits so only 510 samples
-    // TODO maybe just make 510
     if (samples_deinterleaved < 32)
         return false;
 
@@ -751,6 +750,138 @@ bool TRXLooper::CaptureFreshAlignmentPacket(
     return false;
 }
 
+bool TRXLooper::CaptureFreshAlignmentSamples(
+    std::vector<complex16_t>* channel_a_samples,
+    std::vector<complex16_t>* channel_b_samples,
+    int required_sample_count,
+    std::chrono::milliseconds timeout_per_packet)
+{
+    if ((channel_a_samples == nullptr) || (channel_b_samples == nullptr))
+    {
+        return false;
+    }
+
+    channel_a_samples->clear();
+    channel_b_samples->clear();
+
+    OpStatus status = Flush_transport_state_for_alignment();
+    if (status != OpStatus::Success)
+    {
+        return false;
+    }
+
+    status = mRxArgs.dma->Initialize();
+    if (status != OpStatus::Success)
+    {
+        return false;
+    }
+
+    const uint16_t buffer_index = 0;
+    status = fpga->SelectModule(chipId);
+    if (status != OpStatus::Success)
+    {
+        return false;
+    }
+
+    status = mRxArgs.dma->Enable(true);
+    if (status != OpStatus::Success)
+    {
+        return false;
+    }
+
+    fpga->StartStreaming();
+
+    bool success_flag = false;
+
+    // Continue capturing packets until the vector size reaches the required threshold
+    while (static_cast<int>(channel_a_samples->size()) < required_sample_count)
+    {
+        mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
+
+        const IDMA::State baseline_state = mRxArgs.dma->GetCounters();
+        const uint64_t baseline_completed = baseline_state.transfersCompleted;
+
+        status = mRxArgs.dma->SubmitRequest(
+            buffer_index, 
+            mRxArgs.packetSize, 
+            DataTransferDirection::DeviceToHost, 
+            true);
+
+        if (status != OpStatus::Success)
+        {
+            break;
+        }
+
+        const std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
+        bool packet_received = false;
+
+        while ((std::chrono::steady_clock::now() - start_time) < timeout_per_packet)
+        {
+            const IDMA::State current_state = mRxArgs.dma->GetCounters();
+            if (current_state.transfersCompleted > baseline_completed)
+            {
+                FPGA_RxDataPacket hardware_packet;
+                std::vector<complex16_t> temporary_channel_a;
+                std::vector<complex16_t> temporary_channel_b;
+
+                mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
+                
+                std::memset(&hardware_packet, 0, sizeof(FPGA_RxDataPacket));
+                std::memcpy(&hardware_packet, mRxArgs.buffers.at(buffer_index), mRxArgs.packetSize);
+                
+                mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
+
+                // Deinterleave the single packet and append to the aggregate vectors
+                if (!deinterleave_alignment_packet(
+                        mConfig, 
+                        hardware_packet, 
+                        &temporary_channel_a, 
+                        &temporary_channel_b))
+                {
+                    packet_received = false;
+                    break;
+                }
+
+                channel_a_samples->insert(
+                    channel_a_samples->end(), 
+                    temporary_channel_a.begin(), 
+                    temporary_channel_a.end());
+
+                channel_b_samples->insert(
+                    channel_b_samples->end(), 
+                    temporary_channel_b.begin(), 
+                    temporary_channel_b.end());
+
+                packet_received = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+
+        if (!packet_received)
+        {
+            break;
+        }
+    }
+
+    fpga->StopStreaming();
+    mRxArgs.dma->Enable(false);
+
+    if (static_cast<int>(channel_a_samples->size()) >= required_sample_count)
+    {
+        success_flag = true;
+    }
+
+    if (success_flag)
+    {
+        // Truncate to exact required count to maintain DFT alignment if necessary
+        channel_a_samples->resize(required_sample_count);
+        channel_b_samples->resize(required_sample_count);
+    }
+
+    return success_flag;
+}
+
 bool TRXLooper::CaptureAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout)
 {
     if (packet == nullptr)
@@ -911,57 +1042,66 @@ void TRXLooper::ResetRxIQGeneratorAlignmentState()
     lms->SPI_write(0x0020, reg20, true);
 }
 
-alignment_bin_result
-TRXLooper::MeasureAlignmentBin(int bin)
+alignment_bin_result TRXLooper::MeasureAlignmentBin(int bin)
 {
-   alignment_bin_result result;
-   result.bin = bin;
-   FPGA_RxDataPacket packet;
-   const bool        have_packet
-      = CaptureFreshAlignmentPacket(&packet, std::chrono::milliseconds(150));
-   if(!have_packet) return result;
-   std::vector<complex16_t> channel_a_samples;
-   std::vector<complex16_t> channel_b_samples;
-   const bool               deinterleave_ok
-      = deinterleave_alignment_packet(mConfig,
-                                      packet,
-                                      &channel_a_samples,
-                                      &channel_b_samples);
-   if(!deinterleave_ok) return result;
-   static constexpr int dft_length = 512;
-   const int            sample_count
-      = std::min<int>(dft_length, static_cast<int>(channel_a_samples.size()));
-   const complex64f_t imaginary_unit(0.0, 1.0);
-   const double       pi = std::acos(-1.0);
-   complex64f_t       spectrum_a(0.0, 0.0);
-   complex64f_t       spectrum_b(0.0, 0.0);
-   for(int sample_index = 0; sample_index < sample_count; ++sample_index)
-   {
-      const complex64f_t sample_a(channel_a_samples[sample_index].real(),
-                                  channel_a_samples[sample_index].imag());
-      const complex64f_t sample_b(channel_b_samples[sample_index].real(),
-                                  channel_b_samples[sample_index].imag());
-      const complex64f_t phasor
-         = std::exp((-2.0 * imaginary_unit * pi * static_cast<double>(bin)
-                     * static_cast<double>(sample_index))
-                    / static_cast<double>(dft_length));
-      spectrum_a += sample_a * phasor;
-      spectrum_b += sample_b * phasor;
-   }
-   result.power_a = compute_single_bin_power(channel_a_samples,
-                                             bin,
-                                             sample_count,
-                                             dft_length);
-   result.power_b = compute_single_bin_power(channel_b_samples,
-                                             bin,
-                                             sample_count,
-                                             dft_length);
-   result.phase_degrees
-      = std::arg(spectrum_b) * 180.0 / pi - std::arg(spectrum_a) * 180.0 / pi;
-   while(result.phase_degrees < -180.0) result.phase_degrees += 360.0;
-   while(result.phase_degrees > 180.0) result.phase_degrees -= 360.0;
-   result.valid = true;
-   return result;
+    alignment_bin_result result;
+    result.bin = bin;
+    result.valid = false;
+
+    std::vector<complex16_t> channel_a_samples;
+    std::vector<complex16_t> channel_b_samples;
+
+    // Aggregating 256 samples (approx 8 packets at 32 samples/packet)
+    const int required_sample_count = 256;
+    const bool have_samples = CaptureFreshAlignmentSamples(
+        &channel_a_samples, 
+        &channel_b_samples, 
+        required_sample_count, 
+        std::chrono::milliseconds(150));
+
+    if (!have_samples)
+    {
+        return result;
+    }
+
+    static constexpr int dft_length = 512;
+    const int sample_count = static_cast<int>(channel_a_samples.size());
+    const complex64f_t imaginary_unit(0.0, 1.0);
+    const double pi_constant = std::acos(-1.0);
+
+    complex64f_t spectrum_a(0.0, 0.0);
+    complex64f_t spectrum_b(0.0, 0.0);
+
+    // Phasor: exp(-j * 2 * pi * k * n / N)
+    for (int sample_index = 0; sample_index < sample_count; ++sample_index)
+    {
+        const complex64f_t sample_a(
+            static_cast<double>(channel_a_samples[sample_index].real()), 
+            static_cast<double>(channel_a_samples[sample_index].imag()));
+
+        const complex64f_t sample_b(
+            static_cast<double>(channel_b_samples[sample_index].real()), 
+            static_cast<double>(channel_b_samples[sample_index].imag()));
+
+        const double angle = (-2.0 * pi_constant * static_cast<double>(bin) * static_cast<double>(sample_index)) / static_cast<double>(dft_length);
+        const complex64f_t phasor = std::exp(imaginary_unit * angle);
+
+        spectrum_a += sample_a * phasor;
+        spectrum_b += sample_b * phasor;
+    }
+
+    result.power_a = compute_single_bin_power(channel_a_samples, bin, sample_count, dft_length);
+    result.power_b = compute_single_bin_power(channel_b_samples, bin, sample_count, dft_length);
+
+    // Calculate phase difference between channels
+    result.phase_degrees = (std::arg(spectrum_b) - std::arg(spectrum_a)) * 180.0 / pi_constant;
+
+    // Wrap to [-180, 180]
+    while (result.phase_degrees < -180.0) result.phase_degrees += 360.0;
+    while (result.phase_degrees > 180.0) result.phase_degrees -= 360.0;
+
+    result.valid = true;
+    return result;
 }
 
 double
@@ -1164,7 +1304,7 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
 {
    static constexpr double k_alignment_quadrature_power_keep_within_db = 12.0;
    static constexpr std::size_t k_alignment_quadrature_min_valid_bins  = 2;
-   static constexpr double k_alignment_quadrature_mean_abs_phase_deg   = 12.0;
+   const double k_alignment_quadrature_mean_abs_phase_deg = accept_abs_mean_phase_deg;
    static constexpr double k_alignment_quadrature_max_abs_phase_deg    = 20.0;
 
    auto*                   register_backup = lms->BackupRegisterMap();
