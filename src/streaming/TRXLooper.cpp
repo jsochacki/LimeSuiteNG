@@ -613,75 +613,100 @@ bool TRXLooper::ShouldAlignRxPhase() const
     return mConfig.alignPhase && (rx_it->second.size() == 2);
 }
 
-TRXLooper::CaptureFreshAlignmentPacket(FPGA_RxDataPacket*        packet,
-                                       std::chrono::milliseconds timeout)
+bool TRXLooper::CaptureFreshAlignmentPacket(
+    FPGA_RxDataPacket* packet,
+    std::chrono::milliseconds timeout)
 {
-   if(packet == nullptr) return false;
-   OpStatus status = Flush_transport_state_for_alignment();
-   if(status != OpStatus::Success) return false;
-   status = mRxArgs.dma->Initialize();
-   if(status != OpStatus::Success) return false;
-   for(uint16_t buffer_index = 0; buffer_index < mRxArgs.buffers.size();
-       ++buffer_index)
-   {
-      mRxArgs.dma->BufferOwnership(buffer_index,
-                                   DataTransferDirection::HostToDevice);
-   }
-   const IDMA::State baseline_state     = mRxArgs.dma->GetCounters();
-   const uint64_t    baseline_completed = baseline_state.transfersCompleted;
-   const uint32_t    read_size_bytes    = mRxArgs.packetSize;
-   constexpr uint8_t irq_period         = 1;
-   status = mRxArgs.dma->EnableContinuous(true, read_size_bytes, irq_period);
-   if(status != OpStatus::Success) return false;
-   status = fpga->SelectModule(chipId);
-   if(status != OpStatus::Success)
-   {
-      mRxArgs.dma->Enable(false);
-      return false;
-   }
-   fpga->StartStreaming();
-   std::fprintf(stderr,
-                "align: capture baseline completed=%" PRIu64 "\n",
-                baseline_completed);
-   std::fflush(stderr);
-   const auto start_time   = std::chrono::steady_clock::now();
-   const auto buffer_count = mRxArgs.buffers.size();
-   while((std::chrono::steady_clock::now() - start_time) < timeout)
-   {
-      const IDMA::State state = mRxArgs.dma->GetCounters();
-      if(state.transfersCompleted > baseline_completed)
-      {
-         const uint64_t completed_index = state.transfersCompleted - 1;
-         const uint16_t buffer_index
-            = static_cast<uint16_t>(completed_index % buffer_count);
-         std::fprintf(stderr,
-                      "align: capture got completion completed=%" PRIu64 " buf"
-                                                                         "fer_"
-                                                                         "inde"
-                                                                         "x=%"
-                                                                         "u\n",
-                      state.transfersCompleted,
-                      static_cast<unsigned>(buffer_index));
-         std::fflush(stderr);
-         mRxArgs.dma->BufferOwnership(buffer_index,
-                                      DataTransferDirection::DeviceToHost);
-         std::memset(packet, 0, sizeof(FPGA_RxDataPacket));
-         std::memcpy(packet,
-                     mRxArgs.buffers.at(buffer_index),
-                     mRxArgs.packetSize);
-         mRxArgs.dma->BufferOwnership(buffer_index,
-                                      DataTransferDirection::HostToDevice);
-         fpga->StopStreaming();
-         mRxArgs.dma->Enable(false);
-         return true;
-      }
-      std::this_thread::sleep_for(std::chrono::microseconds(50));
-   }
-   std::fprintf(stderr, "align: capture timeout no completion\n");
-   std::fflush(stderr);
-   fpga->StopStreaming();
-   mRxArgs.dma->Enable(false);
-   return false;
+    if (packet == nullptr)
+        return false;
+
+    OpStatus status = Flush_transport_state_for_alignment();
+    if (status != OpStatus::Success)
+        return false;
+
+    status = mRxArgs.dma->Initialize();
+    if (status != OpStatus::Success)
+        return false;
+
+    const uint16_t buffer_index = 0;
+
+    status = fpga->SelectModule(chipId);
+    if (status != OpStatus::Success)
+        return false;
+
+    status = mRxArgs.dma->Enable(true);
+    if (status != OpStatus::Success)
+        return false;
+
+    mRxArgs.dma->BufferOwnership(
+        buffer_index,
+        DataTransferDirection::HostToDevice);
+
+    const IDMA::State baseline_state = mRxArgs.dma->GetCounters();
+    const uint64_t baseline_completed = baseline_state.transfersCompleted;
+
+    status = mRxArgs.dma->SubmitRequest(
+        buffer_index,
+        mRxArgs.packetSize,
+        DataTransferDirection::DeviceToHost,
+        true);
+    if (status != OpStatus::Success)
+    {
+        mRxArgs.dma->Enable(false);
+        return false;
+    }
+
+    fpga->StartStreaming();
+
+    std::fprintf(
+        stderr,
+        "align: capture baseline completed=%" PRIu64 "\n",
+        baseline_completed);
+    std::fflush(stderr);
+
+    const auto start_time = std::chrono::steady_clock::now();
+
+    while ((std::chrono::steady_clock::now() - start_time) < timeout)
+    {
+        const IDMA::State state = mRxArgs.dma->GetCounters();
+
+        if (state.transfersCompleted > baseline_completed)
+        {
+            std::fprintf(
+                stderr,
+                "align: capture got completion completed=%" PRIu64 " buffer_index=%u\n",
+                state.transfersCompleted,
+                static_cast<unsigned>(buffer_index));
+            std::fflush(stderr);
+
+            mRxArgs.dma->BufferOwnership(
+                buffer_index,
+                DataTransferDirection::DeviceToHost);
+
+            std::memset(packet, 0, sizeof(FPGA_RxDataPacket));
+            std::memcpy(
+                packet,
+                mRxArgs.buffers.at(buffer_index),
+                mRxArgs.packetSize);
+
+            mRxArgs.dma->BufferOwnership(
+                buffer_index,
+                DataTransferDirection::HostToDevice);
+
+            fpga->StopStreaming();
+            mRxArgs.dma->Enable(false);
+            return true;
+        }
+
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+
+    std::fprintf(stderr, "align: capture timeout no completion\n");
+    std::fflush(stderr);
+
+    fpga->StopStreaming();
+    mRxArgs.dma->Enable(false);
+    return false;
 }
 
 bool TRXLooper::CaptureAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout)
