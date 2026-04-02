@@ -552,7 +552,9 @@ OpStatus TRXLooper::Prepare_rx_transport_for_alignment_capture(uint32_t number_o
     if (status != OpStatus::Success)
         return status;
 
-    read_size_bytes = mRxArgs.packetSize * mRxArgs.packetsToBatch;
+    // More faithful to original limesuite implementation
+    read_size_bytes = sizeof(FPGA_RxDataPacket);
+    //read_size_bytes = mRxArgs.packetSize * mRxArgs.packetsToBatch;
 
     status = mRxArgs.dma->EnableContinuous(true, read_size_bytes, irq_period);
     if (status != OpStatus::Success)
@@ -752,33 +754,51 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
     if (ok)
         *ok = false;
 
+    const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
     std::fprintf(stderr, "align: prepare_status=%d\n", static_cast<int>(prepare_status));
     std::fflush(stderr);
-    const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
+
     if (prepare_status != OpStatus::Success)
+    {
+        std::fprintf(stderr, "align: prepare failed\n");
+        std::fflush(stderr);
         return 0.0;
+    }
 
     FPGA_RxDataPacket packet;
+
     const bool have_packet = CaptureAlignmentPacket(&packet, std::chrono::milliseconds(50));
 
-    fpga->StopStreaming();
-    mRxArgs.dma->Enable(false);
+   fpga->StopStreaming();
+   mRxArgs.dma->Enable(false);
 
-    std::fprintf(stderr, "align: have_packet=0\n");
-    std::fflush(stderr);
-    if (!have_packet)
-        return 0.0;
+   std::fprintf(stderr, "align: have_packet=%d\n", have_packet ? 1 : 0);
+   std::fflush(stderr);
+
+   if (!have_packet)
+   {
+       std::fprintf(stderr, "align: no packet captured\n");
+       std::fflush(stderr);
+       return 0.0;
+   }
 
     std::vector<complex16_t> channel_a_samples;
     std::vector<complex16_t> channel_b_samples;
 
-    std::fprintf(stderr, "align: deinterleave failed payload_bytes=%u\n",
-    packet.GetPayloadSize() == 0
-        ? static_cast<unsigned>(sizeof(packet.data))
-        : packet.GetPayloadSize());
-    std::fflush(stderr);
-    if (!deinterleave_alignment_packet(mConfig, packet, &channel_a_samples, &channel_b_samples))
-        return 0.0;
+    const bool deinterleave_ok =
+    deinterleave_alignment_packet(mConfig, packet, &channel_a_samples, &channel_b_samples);
+
+   std::fprintf(
+       stderr,
+       "align: deinterleave_ok=%d payload_bytes=%u\n",
+       deinterleave_ok ? 1 : 0,
+       packet.GetPayloadSize() == 0
+           ? static_cast<unsigned>(sizeof(packet.data))
+           : packet.GetPayloadSize());
+   std::fflush(stderr);
+
+   if (!deinterleave_ok)
+       return 0.0;
 
     static constexpr int dft_length = 512;
     const int sample_count = std::min<int>(512, static_cast<int>(channel_a_samples.size()));
