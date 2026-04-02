@@ -92,6 +92,22 @@ class TRXLooper : public RFStream
   private:
     struct Stream;
 
+    struct alignment_bin_result
+    {
+       int    bin;
+       bool   valid;
+       double phase_degrees;
+       double power_a;
+       double power_b;
+       alignment_bin_result(void)
+          : bin(0)
+          , valid(false)
+          , phase_degrees(0.0)
+          , power_a(0.0)
+          , power_b(0.0)
+       {}
+    };
+
     bool ShouldAlignRxPhase() const;
     OpStatus AlignRxPhaseInternal();
     bool AlignRxTSPRobust(uint32_t checkpoint_pairs);
@@ -107,6 +123,8 @@ class TRXLooper : public RFStream
     OpStatus Prepare_rx_transport_for_alignment_capture(void);
     OpStatus Prepare_rx_transport_for_alignment_capture(uint32_t number_of_transfers_to_discard);
     bool CaptureFreshAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout);
+    alignment_bin_result MeasureAlignmentBin(int bin);
+
 
     OpStatus RxSetup();
     void RxWorkLoop();

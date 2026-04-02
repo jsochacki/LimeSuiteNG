@@ -158,7 +158,7 @@ bool deinterleave_alignment_packet(const StreamConfig& config,
     std::fflush(stderr);
     //512 sized packet but header is 16 bits so only 510 samples
     // TODO maybe just make 510
-    if (samples_deinterleaved < 32)
+    if (samples_deinterleaved < 256)
         return false;
 
     channel_a_samples->resize(samples_deinterleaved);
@@ -1231,54 +1231,43 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
     bool aligned = false;
     for (uint32_t iteration = 0; iteration < k_alignment_quadrature_max_iterations; ++iteration)
     {
-       std::vector<alignment_bin_result> measured_bins;
-       measured_bins.reserve(bins.size());
-       for(int bin : bins)
-       {
-          const alignment_bin_result result = MeasureAlignmentBin(bin);
-          if(!result.valid) continue;
-          measured_bins.push_back(result);
-       }
-       const std::vector<alignment_bin_result> filtered_bins
-          = filter_alignment_bins_by_relative_power(
-             measured_bins,
-             k_alignment_quadrature_power_keep_within_db);
-       if(filtered_bins.size() < k_alignment_quadrature_min_valid_bins)
-       {
-          ResetRxIQGeneratorAlignmentState();
-          continue;
-       }
-       std::vector<double> filtered_phase_degrees;
-       filtered_phase_degrees.reserve(filtered_bins.size());
-       for(const alignment_bin_result& result : filtered_bins)
-          filtered_phase_degrees.push_back(result.phase_degrees);
-       const std::vector<double> unwrapped_phase_degrees
-          = unwrap_phase_degrees(filtered_phase_degrees);
-       const double mean_absolute_phase_degrees
-          = mean_absolute_value(unwrapped_phase_degrees);
-       const double maximum_absolute_phase_degrees
-          = max_absolute_value(unwrapped_phase_degrees);
-       std::fprintf(stderr,
-                    "align: quadrature iter=%u mean_abs_phase_deg=%.6f "
-                    "max_abs_phase_deg=%.6f valid_bins=%zu\n",
-                    iteration,
-                    mean_absolute_phase_degrees,
-                    maximum_absolute_phase_degrees,
-                    filtered_bins.size());
-       std::fflush(stderr);
-       if((mean_absolute_phase_degrees
-           <= k_alignment_quadrature_mean_abs_phase_deg)
-          && (maximum_absolute_phase_degrees
-              <= k_alignment_quadrature_max_abs_phase_deg))
-       {
-          std::fprintf(stderr,
-                       "align: quadrature accepted on iteration %u\n",
-                       iteration);
-          std::fflush(stderr);
-          aligned = true;
-          break;
-       }
+        std::vector<double> measured_phase_degrees;
+        measured_phase_degrees.reserve(bins.size());
+        bool all_points_valid = true;
+        for (int bin : bins)
+        {
+            bool valid_point = false;
+            const double measured_phase = MeasurePhaseOffsetDeg(bin, &valid_point);
+            if (!valid_point)
+            {
+                all_points_valid = false;
+                break;
+            }
+            measured_phase_degrees.push_back(measured_phase);
+        }
 
+        if (all_points_valid)
+        {
+            const std::vector<double> unwrapped_phase_degrees = unwrap_phase_degrees(measured_phase_degrees);
+            const double mean_absolute_phase_degrees = mean_absolute_value(unwrapped_phase_degrees);
+
+            std::fprintf(stderr, 
+                "align: quadrature iter=%u mean_absolute_phase_degrees=%.6f accept_abs_mean_phase_deg=%.6f\n",
+                iteration,
+                mean_absolute_phase_degrees,
+                accept_abs_mean_phase_deg);
+             std::fflush(stderr);
+
+            if (mean_absolute_phase_degrees <= accept_abs_mean_phase_deg)
+            {
+                std::fprintf(stderr, "align: quadrature accepted on iteration %u\n", iteration);
+                std::fflush(stderr);
+                aligned = true;
+                break;
+            }
+        }
+
+        ResetRxIQGeneratorAlignmentState();
     }
 
     if (!aligned)
