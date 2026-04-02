@@ -158,7 +158,7 @@ bool deinterleave_alignment_packet(const StreamConfig& config,
     std::fflush(stderr);
     //512 sized packet but header is 16 bits so only 510 samples
     // TODO maybe just make 510
-    if (samples_deinterleaved < 256)
+    if (samples_deinterleaved < 32)
         return false;
 
     channel_a_samples->resize(samples_deinterleaved);
@@ -714,7 +714,7 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
             continue;
 
         FPGA_RxDataPacket packet;
-        const bool have_packet = CaptureAlignmentPacket(&packet, std::chrono::milliseconds(50));
+        const bool have_packet = CaptureAlignmentPacket(&packet, std::chrono::milliseconds(150));
 
         fpga->StopStreaming();
         mRxArgs.dma->Enable(false);
@@ -792,7 +792,7 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
         return 0.0;
     }
     FPGA_RxDataPacket packet;
-    const bool have_packet = CaptureAlignmentPacket(&packet, std::chrono::milliseconds(50));
+    const bool have_packet = CaptureAlignmentPacket(&packet, std::chrono::milliseconds(150));
     fpga->StopStreaming();
     mRxArgs.dma->Enable(false);
     std::fprintf(stderr, "align: have_packet=%d\n", have_packet ? 1 : 0);
