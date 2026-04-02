@@ -680,7 +680,8 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
             lms->SPI_write(0x0020, 0xFFFD, true);
         }
 
-        const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
+        //const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
+        const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(0u);
         if (prepare_status != OpStatus::Success)
             continue;
 
@@ -754,7 +755,8 @@ double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
     if (ok)
         *ok = false;
 
-    const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
+    //const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
+    const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(0u);
     std::fprintf(stderr, "align: prepare_status=%d\n", static_cast<int>(prepare_status));
     std::fflush(stderr);
 
