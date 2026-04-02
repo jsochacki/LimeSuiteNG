@@ -152,13 +152,15 @@ bool deinterleave_alignment_packet(const StreamConfig& config,
     const uint16_t payload_size_bytes = packet.GetPayloadSize() == 0 ? sizeof(packet.data) : packet.GetPayloadSize();
     const int samples_deinterleaved = Deinterleave(destinations, packet.data, payload_size_bytes, conversion);
 
-    std::fprintf(stderr, "align: samples_deinterleaved=%d payload_bytes=%u\n",
-        samples_deinterleaved,
-        payload_size_bytes);
-    std::fflush(stderr);
     //512 sized packet but header is 16 bits so only 510 samples
     if (samples_deinterleaved < 32)
+    {
+       std::fprintf(stderr, "align: samples_deinterleaved=%d payload_bytes=%u\n",
+           samples_deinterleaved,
+           payload_size_bytes);
+       std::fflush(stderr);
         return false;
+    }
 
     channel_a_samples->resize(samples_deinterleaved);
     channel_b_samples->resize(samples_deinterleaved);
