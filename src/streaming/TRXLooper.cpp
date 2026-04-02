@@ -1443,12 +1443,26 @@ bool TRXLooper::AlignQuadratureRobust(const std::vector<int>& bins, double accep
         const double mean_absolute_phase_degrees = mean_absolute_value(unwrapped_phase_degrees);
         const double maximum_absolute_phase_degrees = max_absolute_value(unwrapped_phase_degrees);
 
-        std::fprintf(stderr,
-                     "align: iter=%u mean_abs=%.4f max_abs=%.4f bins=%zu\n",
-                     iteration,
-                     mean_absolute_phase_degrees,
-                     maximum_absolute_phase_degrees,
-                     filtered_bins.size());
+        std::fprintf(
+            stderr,
+            "align: quadrature iter=%u mean_abs_phase_deg=%.6f max_abs_phase_deg=%.6f valid_bins=%zu phases_deg=",
+            iteration,
+            mean_absolute_phase_degrees,
+            maximum_absolute_phase_degrees,
+            filtered_bins.size());
+
+        for (std::size_t phase_index = 0; phase_index < filtered_bins.size(); ++phase_index)
+        {
+            std::fprintf(
+                stderr,
+                "%s%d:%+.6f",
+                phase_index == 0 ? "" : ",",
+                filtered_bins[phase_index].bin,
+                unwrapped_phase_degrees[phase_index]);
+        }
+
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
 
         if ((mean_absolute_phase_degrees <= k_alignment_quadrature_mean_abs_phase_deg) &&
             (maximum_absolute_phase_degrees <= k_alignment_quadrature_max_abs_phase_deg))
