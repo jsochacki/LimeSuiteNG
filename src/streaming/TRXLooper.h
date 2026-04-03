@@ -116,7 +116,7 @@ class TRXLooper : public RFStream
     bool CheckTSPAligned(const FPGA_RxDataPacket& packet, uint32_t checkpoint_pairs) const;
     double MeasurePhaseOffsetDeg(int bin, bool* ok);
     bool SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_index, const std::vector<int>& bins);
-    bool AlignQuadratureRobust(const std::vector<int>& bins, double accept_abs_mean_phase_deg);
+    bool AlignQuadratureRobust(double accept_abs_mean_phase_deg);
     void ResetRxIQGeneratorAlignmentState(void);
     OpStatus Flush_transport_state_for_alignment(void);
     void Recycle_stream_packets_for_alignment(Stream& stream_state);
