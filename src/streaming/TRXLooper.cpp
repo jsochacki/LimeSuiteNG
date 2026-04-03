@@ -1334,12 +1334,12 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
     return false;
 }
 
-bool trx_looper::align_quadrature_robust(double accept_abs_mean_phase_deg)
+bool TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
 {
     const uint16_t caller_mac = lms->spi_read(0x0020, true);
     auto* register_backup = lms->backup_register_map();
 
-    // Configure hardware for alignment mode
+    // Initial hardware setup block
     lms->spi_write(0x0020, 0xFFFF, true);
     lms->spi_write(0x0113, 0x0046, true);
     lms->spi_write(0x0118, 0x418C, true);
@@ -1368,17 +1368,48 @@ bool trx_looper::align_quadrature_robust(double accept_abs_mean_phase_deg)
 
     lms->load_dc_reg_iq(trx_dir::tx, 0x3FFF, 0x3FFF);
 
+    // Path-specific configuration block
+    lms->spi_write(0x0020, 0xFFFE, true);
+    lms->spi_write(0x0105, 0x0006, true);
+    lms->spi_write(0x0100, 0x4038, true);
+    lms->spi_write(0x0113, 0x007F, true);
+    lms->spi_write(0x0119, 0x529B, true);
+
+    uint16_t path_value = lms->get_spi_reg_bits(lms7002mcsr::sel_path_rfe, true);
+    lms->spi_write(0x010D, path_value == 3 ? 0x018F : path_value == 2 ? 0x0117 : 0x008F, true);
+    lms->spi_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
+
+    lms->spi_write(0x0020, 0xFFFD, true);
+    lms->spi_write(0x0103, path_value == 2 ? 0x0612 : 0x0A12, true);
+
+    path_value = lms->get_spi_reg_bits(lms7002mcsr::sel_path_rfe, true);
+    lms->spi_write(0x010D, path_value == 3 ? 0x018F : path_value == 2 ? 0x0117 : 0x008F, true);
+    lms->spi_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
+    lms->spi_write(0x0119, 0x5293, true);
+
     const double sample_rate_hz = lms->get_sample_rate(trx_dir::rx, lms7002m::channel::ch_a);
     const double rx_frequency_hz = lms->get_frequency_sx(trx_dir::rx);
-    const double tx_frequency_hz = rx_frequency_hz + sample_rate_hz / 16.0;
+    const double tx_frequency_hz = rx_frequency_hz + (sample_rate_hz / 16.0);
 
     lms->set_frequency_sx(trx_dir::tx, tx_frequency_hz);
+
+    {
+        const op_status mac_restore_status = lms->set_active_channel(lms7002m::channel::ch_a);
+        if (mac_restore_status != op_status::success)
+        {
+            if (register_backup)
+            {
+                lms->restore_register_map(register_backup);
+            }
+            lms->spi_write(0x0020, caller_mac, true);
+            return false;
+        }
+    }
 
     static constexpr int dft_length = 512;
     int quadrature_bin = static_cast<int>(
         std::llround((tx_frequency_hz - rx_frequency_hz) * static_cast<double>(dft_length) / sample_rate_hz));
 
-    // Normalize bin index
     quadrature_bin %= dft_length;
     if (quadrature_bin < 0)
     {
@@ -1391,7 +1422,6 @@ bool trx_looper::align_quadrature_robust(double accept_abs_mean_phase_deg)
     std::fflush(stderr);
 
     bool aligned = false;
-
     for (uint32_t iteration = 0; iteration < k_alignment_quadrature_max_iterations; ++iteration)
     {
         const alignment_bin_result result = measure_alignment_bin(quadrature_bin);
@@ -1405,7 +1435,7 @@ bool trx_looper::align_quadrature_robust(double accept_abs_mean_phase_deg)
         const double absolute_phase_degrees = std::fabs(result.phase_degrees);
 
         std::fprintf(stderr,
-                     "align: quadrature iter=%u abs_phase_deg=%.6f bin=%d phase_deg=%+.6f power_a=%.3e power_b=%.3e\n",
+                     "align: quadrature iter=%u abs_phase_deg=%.6f phases_deg=%d:%+.6f power_a=%.3e power_b=%.3e\n",
                      iteration, absolute_phase_degrees, quadrature_bin,
                      result.phase_degrees, result.power_a, result.power_b);
         std::fflush(stderr);
@@ -1434,7 +1464,7 @@ bool trx_looper::align_quadrature_robust(double accept_abs_mean_phase_deg)
     lms->spi_write(0x0020, caller_mac, true);
     return aligned;
 }
-   
+
 OpStatus TRXLooper::AlignRxPhaseInternal()
 {
     if (!ShouldAlignRxPhase())
