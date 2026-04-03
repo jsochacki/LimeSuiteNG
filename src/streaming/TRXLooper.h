@@ -21,14 +21,14 @@ class IDMA;
 class LMS7002M;
 struct FPGA_RxDataPacket;
 
-struct alignment_bin_result
+struct AlignmentBinResult
 {
    int    bin;
    bool   valid;
    double phase_degrees;
    double power_a;
    double power_b;
-   alignment_bin_result(void)
+   AlignmentBinResult(void)
       : bin(0)
       , valid(false)
       , phase_degrees(0.0)
@@ -109,27 +109,26 @@ class TRXLooper : public RFStream
   private:
     struct Stream;
 
-    bool ShouldAlignRxPhase() const;
+    bool     ShouldAlignRxPhase() const;
     OpStatus AlignRxPhaseInternal();
-    bool AlignRxTSPRobust(uint32_t checkpoint_pairs);
-    bool CaptureAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout);
-    bool CheckTSPAligned(const FPGA_RxDataPacket& packet, uint32_t checkpoint_pairs) const;
-    double MeasurePhaseOffsetDeg(int bin, bool* ok);
-    bool SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_index, const std::vector<int>& bins);
-    bool AlignQuadratureRobust(double accept_abs_mean_phase_deg);
-    void ResetRxIQGeneratorAlignmentState(void);
-    OpStatus Flush_transport_state_for_alignment(void);
-    void Recycle_stream_packets_for_alignment(Stream& stream_state);
-    OpStatus Discard_initial_rx_dma_transfers_for_alignment(uint32_t number_of_transfers_to_discard, uint8_t irq_period);
-    OpStatus Prepare_rx_transport_for_alignment_capture(void);
-    OpStatus Prepare_rx_transport_for_alignment_capture(uint32_t number_of_transfers_to_discard);
-    bool CaptureFreshAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout);
-    bool CaptureFreshAlignmentSamples(
-        std::vector<complex16_t>* channel_a_samples,
-        std::vector<complex16_t>* channel_b_samples,
-        int required_sample_count,
-        std::chrono::milliseconds timeout_per_packet);
-    alignment_bin_result MeasureAlignmentBin(int bin);
+    bool     AlignRxTSPRobust(uint32_t checkpoint_pairs);
+    bool     CheckTSPAligned(const FPGA_RxDataPacket& packet,
+                             uint32_t                 checkpoint_pairs) const;
+    bool     SearchRxPhaseSlopeState(double                  sample_rate_hz,
+                                     int                     decimation_index,
+                                     const std::vector<int>& bins);
+    bool     AlignQuadratureRobust(double accept_abs_mean_phase_deg);
+    void     ResetRxIQGeneratorAlignmentState(void);
+    OpStatus FlushTransportStateForAlignment(void);
+    void     RecycleStreamPacketsForAlignment(Stream& stream_state);
+    bool     CaptureFreshAlignmentPacket(FPGA_RxDataPacket*        packet,
+                                         std::chrono::milliseconds timeout);
+    bool
+    CaptureFreshAlignmentSamples(std::vector<complex16_t>* channel_a_samples,
+                                 std::vector<complex16_t>* channel_b_samples,
+                                 int required_sample_count,
+                                 std::chrono::milliseconds timeout_per_packet);
+    AlignmentBinResult MeasureAlignmentBin(int bin);
 
 
     OpStatus RxSetup();

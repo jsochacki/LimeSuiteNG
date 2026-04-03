@@ -36,9 +36,9 @@ static constexpr bool showStats{ false };
 static constexpr int statsPeriod_ms{ 1000 }; // at 122.88 MHz MIMO, fpga tx pkt counter overflows every 272ms
 
 static constexpr uint32_t k_alignment_tsp_checkpoint_pairs = 8;
-static constexpr uint32_t k_alignment_tsp_max_iterations = 128;
-static constexpr uint32_t k_alignment_slope_max_iterations = 256;
-static constexpr uint32_t k_alignment_quadrature_max_iterations = 32;
+static constexpr uint32_t k_alignment_tsp_max_iterations = 64;
+static constexpr uint32_t k_alignment_slope_max_iterations = 64;
+static constexpr uint32_t k_alignment_quadrature_max_iterations = 64;
 static constexpr double k_alignment_quadrature_accept_mean_deg = 89.0;
 
 static_assert(offsetof(FPGA_RxDataPacket, header0) == 0, "unexpected FPGA_RxDataPacket layout");
@@ -235,19 +235,19 @@ max_absolute_value(const std::vector<double>& values)
 }
 
 static double
-minimum_channel_power(const alignment_bin_result& result)
+minimum_channel_power(const AlignmentBinResult& result)
 {
    return std::min(result.power_a, result.power_b);
 }
 
-static std::vector<alignment_bin_result>
+static std::vector<AlignmentBinResult>
 filter_alignment_bins_by_relative_power(
-   const std::vector<alignment_bin_result>& results,
+   const std::vector<AlignmentBinResult>& results,
    double                                   keep_within_db)
 {
-   std::vector<alignment_bin_result> filtered_results;
+   std::vector<AlignmentBinResult> filtered_results;
    double                            strongest_minimum_power = 0.0;
-   for(const alignment_bin_result& result : results)
+   for(const AlignmentBinResult& result : results)
    {
       if(!result.valid) continue;
       strongest_minimum_power
@@ -257,7 +257,7 @@ filter_alignment_bins_by_relative_power(
    const double minimum_allowed_ratio = std::pow(10.0, -keep_within_db / 10.0);
    const double minimum_allowed_power
       = strongest_minimum_power * minimum_allowed_ratio;
-   for(const alignment_bin_result& result : results)
+   for(const AlignmentBinResult& result : results)
    {
       if(!result.valid) continue;
       if(minimum_channel_power(result) >= minimum_allowed_power)
@@ -391,59 +391,488 @@ OpStatus TRXLooper::SetHardwareTimestamp(const uint64_t now)
     return OpStatus::Success;
 }
 
-void TRXLooper::Recycle_stream_packets_for_alignment(Stream& stream_state)
+bool TRXLooper::ShouldAlignRxPhase() const
 {
-    StreamPacket* packet_pointer = nullptr;
+    const auto rx_it = mConfig.channels.find(TRXDir::Rx);
+    if (rx_it == mConfig.channels.end())
+        return false;
 
-    if (stream_state.stagingPacket != nullptr)
-    {
-        stream_state.stagingPacket->Reset();
-
-        if (stream_state.packetsPool)
-            stream_state.packetsPool->push(stream_state.stagingPacket, true);
-        else
-            delete stream_state.stagingPacket;
-
-        stream_state.stagingPacket = nullptr;
-    }
-
-    if (stream_state.fifo != nullptr)
-    {
-        while (stream_state.fifo->pop(&packet_pointer, false))
-        {
-            if (packet_pointer != nullptr)
-            {
-                packet_pointer->Reset();
-
-                if (stream_state.packetsPool)
-                    stream_state.packetsPool->push(packet_pointer, true);
-                else
-                    delete packet_pointer;
-            }
-        }
-
-        stream_state.fifo->clear();
-    }
+    return mConfig.alignPhase && (rx_it->second.size() == 2);
 }
 
-OpStatus TRXLooper::Flush_transport_state_for_alignment(void)
+OpStatus TRXLooper::AlignRxPhaseInternal()
+{
+    if (!ShouldAlignRxPhase())
+        return OpStatus::Success;
+
+    const uint16_t mac_backup = lms->SPI_read(0x0020, true);
+    auto* register_backup = lms->BackupRegisterMap();
+
+    lms->SPI_write(0x0020, 0xFFFF, true);
+    lms->SPI_write(0x010C, 0x88C5, true);
+    lms->SPI_write(0x010D, 0x0117, true);
+    lms->SPI_write(0x0113, 0x024A, true);
+    lms->SPI_write(0x0118, 0x418C, true);
+    lms->SPI_write(0x0100, 0x4039, true);
+    lms->SPI_write(0x0101, 0x7801, true);
+    lms->SPI_write(0x0103, 0x0612, true);
+    lms->SPI_write(0x0108, 0x318C, true);
+    lms->SPI_write(0x0082, 0x8001, true);
+    lms->SPI_write(0x0200, 0x008D, true);
+    lms->SPI_write(0x0208, 0x01FB, true);
+    lms->SPI_write(0x0400, 0x8081, true);
+    lms->SPI_write(0x040C, 0x01FF, true);
+    lms->SPI_write(0x0404, 0x0006, true);
+
+    {
+        const OpStatus mac_restore_status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+        if (mac_restore_status != OpStatus::Success)
+        {
+            if (register_backup)
+                lms->RestoreRegisterMap(register_backup);
+
+            lms->SPI_write(0x0020, mac_backup, true);
+            return mac_restore_status;
+        }
+    }
+    std::fprintf(stderr, "align: forced MAC back to channel A before slope search\n");
+    std::fflush(stderr);
+
+    lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+
+    const double sample_rate_hz = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
+    lms->SetFrequencySX(TRXDir::Rx, 450.0e6);
+
+    int decimation_index = lms->Get_SPI_Reg_bits(LMS7002MCSR::HBD_OVR_RXTSP, true);
+    if (decimation_index > 4)
+        decimation_index = 0;
+
+    std::fprintf(stderr, 
+        "align: slope search sample_rate_hz=%.3f decimation_index=%d\n",
+        sample_rate_hz,
+        decimation_index);
+    std::fflush(stderr);
+
+    const std::vector<int> slope_bins = { 16, 24, 32, 40, 48, 56, 64 };
+    const bool slope_state_ok = SearchRxPhaseSlopeState(sample_rate_hz, decimation_index, slope_bins);
+
+    if (register_backup)
+        lms->RestoreRegisterMap(register_backup);
+
+    lms->SPI_write(0x0020, mac_backup, true);
+
+    if (!slope_state_ok)
+    {
+        lime::warning("Rx phase alignment failed during slope-state search");
+        return OpStatus::Error;
+    }
+
+    const bool quadrature_ok = AlignQuadratureRobust(k_alignment_quadrature_accept_mean_deg);
+    if (!quadrature_ok)
+    {
+        lime::warning("Rx phase alignment failed during quadrature-state search");
+        return OpStatus::Error;
+    }
+
+    return OpStatus::Success;
+}
+
+bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
+{
+    uint16_t reg0400_a = 0;
+    uint16_t reg040c_a = 0;
+    uint16_t reg0400_b = 0;
+    uint16_t reg040c_b = 0;
+
+    {
+        LMS7002M::ChannelScope channel_a_scope(lms, LMS7002M::Channel::ChA);
+        reg0400_a = lms->SPI_read(0x0400, true);
+        reg040c_a = lms->SPI_read(0x040C, true);
+    }
+    {
+        LMS7002M::ChannelScope channel_b_scope(lms, LMS7002M::Channel::ChB);
+        reg0400_b = lms->SPI_read(0x0400, true);
+        reg040c_b = lms->SPI_read(0x040C, true);
+    }
+
+    {
+        const OpStatus write_both_status =
+            WriteAlignmentRegistersToBothChannels(lms, 0x0400, 0x8085, 0x040C, 0x01FF);
+
+        if (write_both_status != OpStatus::Success)
+        {
+            lime::warning("align: failed to write temporary RxTSP alignment registers to both channels");
+            return false;
+        }
+    }
+
+    bool aligned = false;
+    for (uint32_t iteration = 0; iteration < k_alignment_tsp_max_iterations; ++iteration)
+    {
+        {
+            LMS7002M::ChannelScope channel_scope(lms, LMS7002M::Channel::ChA);
+            lms->SPI_write(0x0020, 0x55FE, true);
+            lms->SPI_write(0x0020, 0xFFFD, true);
+        }
+
+        FPGA_RxDataPacket packet;
+        const bool        have_packet
+           = CaptureFreshAlignmentPacket(&packet,
+                                         std::chrono::milliseconds(150));
+        if(!have_packet) continue;
+
+        if (CheckTSPAligned(packet, checkpoint_pairs))
+        {
+            aligned = true;
+            break;
+        }
+    }
+
+    if (!aligned)
+    {
+        lime::warning("align: tsp search exhausted without success");
+    }
+
+    {
+        LMS7002M::ChannelScope channel_a_scope(lms, LMS7002M::Channel::ChA);
+        lms->SPI_write(0x0400, reg0400_a, true);
+        lms->SPI_write(0x040C, reg040c_a, true);
+    }
+    {
+        LMS7002M::ChannelScope channel_b_scope(lms, LMS7002M::Channel::ChB);
+        lms->SPI_write(0x0400, reg0400_b, true);
+        lms->SPI_write(0x040C, reg040c_b, true);
+    }
+
+    return aligned;
+}
+
+bool TRXLooper::CheckTSPAligned(const FPGA_RxDataPacket& packet, uint32_t checkpoint_pairs) const
+{
+    const uint16_t payload_size_bytes = packet.GetPayloadSize() == 0 ? sizeof(packet.data) : packet.GetPayloadSize();
+    const uint32_t payload_word_count = payload_size_bytes / sizeof(uint32_t);
+    const uint32_t required_word_count = checkpoint_pairs * 2;
+    if (payload_word_count < required_word_count)
+        return false;
+
+    const uint32_t* payload_words = reinterpret_cast<const uint32_t*>(packet.data);
+    for (uint32_t pair_index = 0; pair_index < checkpoint_pairs; ++pair_index)
+    {
+        const uint32_t left_word = payload_words[2 * pair_index + 0];
+        const uint32_t right_word = payload_words[2 * pair_index + 1];
+        if (left_word != right_word)
+            return false;
+    }
+
+    return true;
+}
+
+bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_index, const std::vector<int>& bins)
+{
+    static constexpr double k_alignment_slope_power_keep_within_db = 12.0;
+    static constexpr std::size_t k_alignment_slope_min_valid_bins = 4;
+    static const double legacy_offsets[] = { 1.15 / 60.0, 1.10 / 40.0, 0.55 / 20.0, 0.20 / 10.0, 0.18 / 5.0 };
+    static const double legacy_tolerances[] = { 0.90, 0.45, 0.25, 0.14, 0.06 };
+
+    if (decimation_index < 0 || decimation_index > 4)
+        decimation_index = 0;
+
+    const double expected_phase_difference_deg = legacy_offsets[decimation_index] * sample_rate_hz / 1.0e6;
+    const double expected_slope_deg_per_bin = -expected_phase_difference_deg / 32.0;
+    const double slope_tolerance_deg_per_bin = legacy_tolerances[decimation_index] / 32.0;
+    const double residual_rms_tolerance_deg = std::max(2.0, legacy_tolerances[decimation_index] * 8.0);
+
+    std::fprintf(stderr, "align: slope search start\n");
+    std::fflush(stderr);
+
+    for (uint32_t iteration = 0; iteration < k_alignment_slope_max_iterations; ++iteration)
+    {
+        lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_FDIV_O_CGEN, 1, true);
+        lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_FDIV_O_CGEN, 0, true);
+
+        if (!AlignRxTSPRobust(k_alignment_tsp_checkpoint_pairs))
+            continue;
+
+
+        std::vector<AlignmentBinResult> measured_bins;
+        measured_bins.reserve(bins.size());
+        for(int bin : bins)
+        {
+           const double tx_frequency_hz
+              = 450.0e6 + sample_rate_hz * static_cast<double>(bin) / 512.0;
+           lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
+           const AlignmentBinResult result = MeasureAlignmentBin(bin);
+           if(!result.valid)
+           {
+              measured_bins.clear();
+              break;
+           }
+           measured_bins.push_back(result);
+        }
+        if(measured_bins.empty()) continue;
+        const std::vector<AlignmentBinResult> filtered_bins
+           = filter_alignment_bins_by_relative_power(
+              measured_bins,
+              k_alignment_slope_power_keep_within_db);
+        if(filtered_bins.size() < k_alignment_slope_min_valid_bins) continue;
+        std::vector<int>    filtered_bin_indices;
+        std::vector<double> filtered_phase_degrees;
+        for(const AlignmentBinResult& result : filtered_bins)
+        {
+           filtered_bin_indices.push_back(result.bin);
+           filtered_phase_degrees.push_back(result.phase_degrees);
+        }
+        const std::vector<double> unwrapped_phase_degrees
+           = unwrap_phase_degrees(filtered_phase_degrees);
+        double fitted_slope_deg_per_bin = 0.0;
+        double fitted_intercept_deg     = 0.0;
+        double fitted_rms_error_deg     = 0.0;
+        if(!linear_fit_phase_vs_bin(filtered_bin_indices,
+                                    unwrapped_phase_degrees,
+                                    &fitted_slope_deg_per_bin,
+                                    &fitted_intercept_deg,
+                                    &fitted_rms_error_deg))
+        {
+           continue;
+        }
+
+
+        const double slope_error_deg_per_bin =
+            std::fabs(fitted_slope_deg_per_bin - expected_slope_deg_per_bin);
+
+         std::fprintf(
+             stderr,
+             "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f phases_deg=",
+             iteration,
+             fitted_slope_deg_per_bin,
+             expected_slope_deg_per_bin,
+             slope_error_deg_per_bin,
+             fitted_rms_error_deg);
+
+         for (std::size_t phase_index = 0; phase_index < filtered_bin_indices.size(); ++phase_index)
+         {
+             std::fprintf(
+                 stderr,
+                 "%s%d:%+.6f",
+                 phase_index == 0 ? "" : ",",
+                 filtered_bin_indices[phase_index],
+                 unwrapped_phase_degrees[phase_index]);
+         }
+
+         std::fprintf(stderr, "\n");
+         std::fflush(stderr);
+
+        if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) &&
+            (fitted_rms_error_deg <= residual_rms_tolerance_deg))
+        {
+            std::fprintf(stderr, "align: slope search accepted on iteration %u\n", iteration);
+           std::fflush(stderr);
+            return true;
+        }
+    }
+
+    lime::warning("align: slope search exhausted without success");
+    return false;
+}
+
+bool
+TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
+{
+   const uint16_t caller_mac      = lms->SPI_read(0x0020, true);
+   auto*          register_backup = lms->BackupRegisterMap();
+   lms->SPI_write(0x0020, 0xFFFF, true);
+   lms->SPI_write(0x0113, 0x0046, true);
+   lms->SPI_write(0x0118, 0x418C, true);
+   lms->SPI_write(0x0100, 0x4039, true);
+   lms->SPI_write(0x0101, 0x7801, true);
+   lms->SPI_write(0x0108, 0x318C, true);
+   lms->SPI_write(0x0082, 0x8001, true);
+   lms->SPI_write(0x0200, 0x008D, true);
+   lms->SPI_write(0x0208, 0x01FB, true);
+   lms->SPI_write(0x0400, 0x8081, true);
+   lms->SPI_write(0x040C, 0x01FF, true);
+   lms->SPI_write(0x0404, 0x0006, true);
+   {
+      const OpStatus status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+      if(status != OpStatus::Success)
+      {
+         if(register_backup) lms->RestoreRegisterMap(register_backup);
+         lms->SPI_write(0x0020, caller_mac, true);
+         return false;
+      }
+   }
+   lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+   lms->SPI_write(0x0020, 0xFFFE, true);
+   lms->SPI_write(0x0105, 0x0006, true);
+   lms->SPI_write(0x0100, 0x4038, true);
+   lms->SPI_write(0x0113, 0x007F, true);
+   lms->SPI_write(0x0119, 0x529B, true);
+   uint16_t path_value
+      = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
+
+   lms->SPI_write(0x010D,
+                  path_value == 3   ? 0x018F
+                  : path_value == 2 ? 0x0117
+                                    : 0x008F,
+                  true);
+
+   lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
+   lms->SPI_write(0x0020, 0xFFFD, true);
+   lms->SPI_write(0x0103, path_value == 2 ? 0x0612 : 0x0A12, true);
+   path_value = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
+
+   lms->SPI_write(0x010D,
+                  path_value == 3   ? 0x018F
+                  : path_value == 2 ? 0x0117
+                                    : 0x008F,
+                  true);
+
+   lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
+   lms->SPI_write(0x0119, 0x5293, true);
+
+   const double sample_rate_hz
+      = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
+   const double rx_frequency_hz = lms->GetFrequencySX(TRXDir::Rx);
+   const double tx_frequency_hz = rx_frequency_hz + sample_rate_hz / 16.0;
+
+   lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
+   {
+      const OpStatus mac_restore_status
+         = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+      if(mac_restore_status != OpStatus::Success)
+      {
+         if(register_backup) lms->RestoreRegisterMap(register_backup);
+         lms->SPI_write(0x0020, caller_mac, true);
+         return false;
+      }
+   }
+
+   static constexpr int dft_length = 512;
+
+   int quadrature_bin = static_cast<int>(
+      std::llround((tx_frequency_hz - rx_frequency_hz)
+                   * static_cast<double>(dft_length) / sample_rate_hz));
+
+   quadrature_bin %= dft_length;
+
+   if(quadrature_bin < 0) quadrature_bin += dft_length;
+   std::fprintf(stderr,
+                "align: forced MAC back to channel A before quadrature "
+                "search\n");
+   std::fprintf(stderr,
+                "align: quadrature search start quadrature_bin=%d "
+                "tx_minus_rx_hz=%.3f\n",
+                quadrature_bin,
+                tx_frequency_hz - rx_frequency_hz);
+   std::fflush(stderr);
+   bool aligned = false;
+   for(uint32_t iteration = 0;
+       iteration < k_alignment_quadrature_max_iterations;
+       ++iteration)
+   {
+      const AlignmentBinResult result = MeasureAlignmentBin(quadrature_bin);
+      if(!result.valid)
+      {
+         ResetRxIQGeneratorAlignmentState();
+         continue;
+      }
+      const double absolute_phase_degrees = std::fabs(result.phase_degrees);
+      std::fprintf(stderr,
+                   "align: quadrature iter=%u abs_phase_deg=%.6f "
+                   "phases_deg=%d:%+.6f power_a=%.3e power_b=%.3e\n",
+                   iteration,
+                   absolute_phase_degrees,
+                   quadrature_bin,
+                   result.phase_degrees,
+                   result.power_a,
+                   result.power_b);
+      std::fflush(stderr);
+      if(absolute_phase_degrees <= accept_abs_mean_phase_deg)
+      {
+         std::fprintf(stderr,
+                      "align: quadrature accepted on iteration %u\n",
+                      iteration);
+         std::fflush(stderr);
+         aligned = true;
+         break;
+      }
+      ResetRxIQGeneratorAlignmentState();
+   }
+   if(!aligned)
+   {
+      lime::warning("align: quadrature search exhausted without success");
+   }
+   if(register_backup) lms->RestoreRegisterMap(register_backup);
+   lms->SPI_write(0x0020, caller_mac, true);
+   return aligned;
+}
+
+
+void TRXLooper::ResetRxIQGeneratorAlignmentState(void)
+{
+    // Backup the original MAC to restore at the very end of the routine
+    const uint16_t caller_mac = lms->SPI_read(0x0020, true);
+
+    const LMS7002M::Channel channels_to_reset[2] =
+    {
+        LMS7002M::Channel::ChA,
+        LMS7002M::Channel::ChB
+    };
+
+    for (LMS7002M::Channel channel_value : channels_to_reset)
+    {
+        const OpStatus channel_status = lms->SetActiveChannel(channel_value);
+        if (channel_status != OpStatus::Success)
+        {
+            // Emergency restore if channel selection fails
+            lms->SPI_write(0x0020, caller_mac, true);
+            return;
+        }
+
+        // Local backup for register values that require bitwise modification
+        const uint16_t register_0020_backup = lms->SPI_read(0x0020, true);
+        const uint16_t register_010c_backup = lms->SPI_read(0x010C, true);
+        const uint16_t register_011c_backup = lms->SPI_read(0x011C, true);
+
+        // Perform the toggling sequence to reset the IQ generator state machine
+        lms->SPI_write(0x0020, 0xFFFD, true);
+        lms->SPI_write(0x011C, static_cast<uint16_t>(register_011c_backup | 0x0010), true);
+
+        lms->SPI_write(0x0020, 0xFFFF, true);
+        lms->SPI_write(0x0124, 0x001F, true);
+
+        lms->SPI_write(0x010C, static_cast<uint16_t>(register_010c_backup | 0x0008), true);
+        lms->SPI_write(0x010C, register_010c_backup, true);
+
+        lms->SPI_write(0x0020, 0xFFFD, true);
+        lms->SPI_write(0x011C, register_011c_backup, true);
+
+        // Restore the local MAC for this channel iteration
+        lms->SPI_write(0x0020, register_0020_backup, true);
+    }
+
+    // Final restoration of the MAC present before the function call
+    lms->SPI_write(0x0020, caller_mac, true);
+}
+
+OpStatus TRXLooper::FlushTransportStateForAlignment(void)
 {
     OpStatus status = OpStatus::Success;
 
     if (mStreamEnabled)
     {
         return ReportError(
-            OpStatus::Busy, "Flush_transport_state_for_alignment() requires mStreamEnabled == false");
+            OpStatus::Busy, "FlushTransportStateForAlignment() requires mStreamEnabled == false");
     }
 
     if (mRx.stage.load(std::memory_order_relaxed) == Stream::ReadyStage::Active)
     {
-        return ReportError(OpStatus::Busy, "Flush_transport_state_for_alignment() requires Rx worker idle");
+        return ReportError(OpStatus::Busy, "FlushTransportStateForAlignment() requires Rx worker idle");
     }
 
     if (mTx.stage.load(std::memory_order_relaxed) == Stream::ReadyStage::Active)
     {
-        return ReportError(OpStatus::Busy, "Flush_transport_state_for_alignment() requires Tx worker idle");
+        return ReportError(OpStatus::Busy, "FlushTransportStateForAlignment() requires Tx worker idle");
     }
 
     status = fpga->SelectModule(chipId);
@@ -479,8 +908,8 @@ OpStatus TRXLooper::Flush_transport_state_for_alignment(void)
             mTxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
     }
 
-    Recycle_stream_packets_for_alignment(mRx);
-    Recycle_stream_packets_for_alignment(mTx);
+    RecycleStreamPacketsForAlignment(mRx);
+    RecycleStreamPacketsForAlignment(mTx);
 
     mRx.lastTimestamp.store(0, std::memory_order_relaxed);
     mTx.lastTimestamp.store(0, std::memory_order_relaxed);
@@ -498,162 +927,39 @@ OpStatus TRXLooper::Flush_transport_state_for_alignment(void)
     return OpStatus::Success;
 }
 
-OpStatus TRXLooper::Discard_initial_rx_dma_transfers_for_alignment(uint32_t number_of_transfers_to_discard, uint8_t irq_period)
+void TRXLooper::RecycleStreamPacketsForAlignment(Stream& stream_state)
 {
-    OpStatus status = OpStatus::Success;
-    IDMA::State dma_state;
-    uint64_t last_completed_transfer_count = 0;
-    uint64_t submit_request_count = 0;
-    uint32_t discarded_transfer_count = 0;
-    uint32_t current_buffer_index = 0;
-    uint32_t buffer_count = 0;
-    uint32_t read_size_bytes = 0;
-    bool request_irq = false;
+    StreamPacket* packet_pointer = nullptr;
 
-    if (mStreamEnabled)
+    if (stream_state.stagingPacket != nullptr)
     {
-        return ReportError(
-            OpStatus::Busy, "Discard_initial_rx_dma_transfers_for_alignment() requires mStreamEnabled == false");
+        stream_state.stagingPacket->Reset();
+
+        if (stream_state.packetsPool)
+            stream_state.packetsPool->push(stream_state.stagingPacket, true);
+        else
+            delete stream_state.stagingPacket;
+
+        stream_state.stagingPacket = nullptr;
     }
 
-    if (mRx.stage.load(std::memory_order_relaxed) == Stream::ReadyStage::Active)
+    if (stream_state.fifo != nullptr)
     {
-        return ReportError(OpStatus::Busy, "Discard_initial_rx_dma_transfers_for_alignment() requires Rx worker idle");
-    }
-
-    if (mTx.stage.load(std::memory_order_relaxed) == Stream::ReadyStage::Active)
-    {
-        return ReportError(OpStatus::Busy, "Discard_initial_rx_dma_transfers_for_alignment() requires Tx worker idle");
-    }
-
-    if (mRxArgs.dma == nullptr)
-    {
-        return ReportError(
-            OpStatus::InvalidValue, "Discard_initial_rx_dma_transfers_for_alignment() requires a valid Rx DMA object");
-    }
-
-    if (mRxArgs.buffers.empty())
-    {
-        return ReportError(OpStatus::InvalidValue,
-            "Discard_initial_rx_dma_transfers_for_alignment() requires allocated Rx DMA buffers");
-    }
-
-    if (mRxArgs.packetSize == 0 || mRxArgs.packetsToBatch == 0)
-    {
-        return ReportError(
-            OpStatus::InvalidValue, "Discard_initial_rx_dma_transfers_for_alignment() requires valid Rx packet sizing");
-    }
-
-    if (number_of_transfers_to_discard == 0)
-        return OpStatus::Success;
-
-    buffer_count = static_cast<uint32_t>(mRxArgs.buffers.size());
-    read_size_bytes = mRxArgs.packetSize * mRxArgs.packetsToBatch;
-
-    dma_state = mRxArgs.dma->GetCounters();
-    last_completed_transfer_count = dma_state.transfersCompleted;
-
-    while (discarded_transfer_count < number_of_transfers_to_discard)
-    {
-        status = mRxArgs.dma->Wait();
-        if (status != OpStatus::Success)
-            return status;
-
-        dma_state = mRxArgs.dma->GetCounters();
-
-        while (last_completed_transfer_count != dma_state.transfersCompleted &&
-            discarded_transfer_count < number_of_transfers_to_discard)
+        while (stream_state.fifo->pop(&packet_pointer, false))
         {
-            current_buffer_index = static_cast<uint32_t>(submit_request_count % buffer_count);
+            if (packet_pointer != nullptr)
+            {
+                packet_pointer->Reset();
 
-            mRxArgs.dma->BufferOwnership(static_cast<uint16_t>(current_buffer_index), DataTransferDirection::DeviceToHost);
-
-            mRxArgs.dma->BufferOwnership(static_cast<uint16_t>(current_buffer_index), DataTransferDirection::HostToDevice);
-
-            request_irq = ((submit_request_count % irq_period) == 0);
-
-            status = mRxArgs.dma->SubmitRequest(
-                current_buffer_index, read_size_bytes, DataTransferDirection::DeviceToHost, request_irq);
-            if (status != OpStatus::Success)
-                return status;
-
-            ++submit_request_count;
-            ++discarded_transfer_count;
-            ++last_completed_transfer_count;
+                if (stream_state.packetsPool)
+                    stream_state.packetsPool->push(packet_pointer, true);
+                else
+                    delete packet_pointer;
+            }
         }
+
+        stream_state.fifo->clear();
     }
-
-    return OpStatus::Success;
-}
-
-OpStatus TRXLooper::Prepare_rx_transport_for_alignment_capture(void)
-{
-    OpStatus status = Flush_transport_state_for_alignment();
-    if (status != OpStatus::Success)
-        return status;
-
-    const uint32_t read_size_bytes = mRxArgs.packetSize;
-    constexpr uint8_t irq_period = 1;
-
-    status = mRxArgs.dma->EnableContinuous(true, read_size_bytes, irq_period);
-    if (status != OpStatus::Success)
-        return status;
-
-    status = fpga->SelectModule(chipId);
-    if (status != OpStatus::Success)
-    {
-        mRxArgs.dma->Enable(false);
-        return status;
-    }
-
-    fpga->StartStreaming();
-    return OpStatus::Success;
-}
-
-//OpStatus TRXLooper::Prepare_rx_transport_for_alignment_capture(uint32_t number_of_transfers_to_discard)
-//{
-//    OpStatus status = Flush_transport_state_for_alignment();
-//    uint32_t read_size_bytes = 0;
-//    constexpr uint8_t irq_period = 4;
-//
-//    if (status != OpStatus::Success)
-//        return status;
-//
-//    // More faithful to original limesuite implementation
-//    read_size_bytes = sizeof(FPGA_RxDataPacket);
-//    //read_size_bytes = mRxArgs.packetSize * mRxArgs.packetsToBatch;
-//
-//    status = mRxArgs.dma->EnableContinuous(true, read_size_bytes, irq_period);
-//    if (status != OpStatus::Success)
-//        return status;
-//
-//    status = fpga->SelectModule(chipId);
-//    if (status != OpStatus::Success)
-//    {
-//        mRxArgs.dma->Enable(false);
-//        return status;
-//    }
-//
-//    fpga->StartStreaming();
-//
-//    status = Discard_initial_rx_dma_transfers_for_alignment(number_of_transfers_to_discard, irq_period);
-//    if (status != OpStatus::Success)
-//    {
-//        fpga->StopStreaming();
-//        mRxArgs.dma->Enable(false);
-//        return status;
-//    }
-//
-//    return OpStatus::Success;
-//}
-
-bool TRXLooper::ShouldAlignRxPhase() const
-{
-    const auto rx_it = mConfig.channels.find(TRXDir::Rx);
-    if (rx_it == mConfig.channels.end())
-        return false;
-
-    return mConfig.alignPhase && (rx_it->second.size() == 2);
 }
 
 bool TRXLooper::CaptureFreshAlignmentPacket(
@@ -663,7 +969,7 @@ bool TRXLooper::CaptureFreshAlignmentPacket(
     if (packet == nullptr)
         return false;
 
-    OpStatus status = Flush_transport_state_for_alignment();
+    OpStatus status = FlushTransportStateForAlignment();
     if (status != OpStatus::Success)
         return false;
 
@@ -766,7 +1072,7 @@ bool TRXLooper::CaptureFreshAlignmentSamples(
     channel_a_samples->clear();
     channel_b_samples->clear();
 
-    OpStatus status = Flush_transport_state_for_alignment();
+    OpStatus status = FlushTransportStateForAlignment();
     if (status != OpStatus::Success)
     {
         return false;
@@ -884,188 +1190,9 @@ bool TRXLooper::CaptureFreshAlignmentSamples(
     return success_flag;
 }
 
-bool TRXLooper::CaptureAlignmentPacket(FPGA_RxDataPacket* packet, std::chrono::milliseconds timeout)
+AlignmentBinResult TRXLooper::MeasureAlignmentBin(int bin)
 {
-    if (packet == nullptr)
-        return false;
-    const auto start_time = std::chrono::steady_clock::now();
-    const auto buffer_count = mRxArgs.buffers.size();
-    const IDMA::State initial_state = mRxArgs.dma->GetCounters();
-    uint64_t last_completed = initial_state.transfersCompleted;
-    std::fprintf(stderr, "align: capture start completed=%" PRIu64 "\n", last_completed);
-    std::fflush(stderr);
-    while ((std::chrono::steady_clock::now() - start_time) < timeout)
-    {
-        const IDMA::State state = mRxArgs.dma->GetCounters();
-        if (state.transfersCompleted != last_completed)
-        {
-            const uint64_t completed_index = state.transfersCompleted - 1;
-            const uint16_t buffer_index = static_cast<uint16_t>(completed_index % buffer_count);
-            std::fprintf(stderr,
-                "align: capture got completion completed=%" PRIu64 " buffer_index=%u\n",
-                state.transfersCompleted,
-                static_cast<unsigned>(buffer_index));
-            std::fflush(stderr);
-            mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
-            std::memset(packet, 0, sizeof(FPGA_RxDataPacket));
-            std::memcpy(packet, mRxArgs.buffers.at(buffer_index), mRxArgs.packetSize);
-            mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
-            return true;
-        }
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
-    std::fprintf(stderr, "align: capture timeout no completion\n");
-    std::fflush(stderr);
-    return false;
-}
-
-bool TRXLooper::CheckTSPAligned(const FPGA_RxDataPacket& packet, uint32_t checkpoint_pairs) const
-{
-    const uint16_t payload_size_bytes = packet.GetPayloadSize() == 0 ? sizeof(packet.data) : packet.GetPayloadSize();
-    const uint32_t payload_word_count = payload_size_bytes / sizeof(uint32_t);
-    const uint32_t required_word_count = checkpoint_pairs * 2;
-    if (payload_word_count < required_word_count)
-        return false;
-
-    const uint32_t* payload_words = reinterpret_cast<const uint32_t*>(packet.data);
-    for (uint32_t pair_index = 0; pair_index < checkpoint_pairs; ++pair_index)
-    {
-        const uint32_t left_word = payload_words[2 * pair_index + 0];
-        const uint32_t right_word = payload_words[2 * pair_index + 1];
-        if (left_word != right_word)
-            return false;
-    }
-
-    return true;
-}
-
-bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
-{
-    uint16_t reg0400_a = 0;
-    uint16_t reg040c_a = 0;
-    uint16_t reg0400_b = 0;
-    uint16_t reg040c_b = 0;
-
-    {
-        LMS7002M::ChannelScope channel_a_scope(lms, LMS7002M::Channel::ChA);
-        reg0400_a = lms->SPI_read(0x0400, true);
-        reg040c_a = lms->SPI_read(0x040C, true);
-    }
-    {
-        LMS7002M::ChannelScope channel_b_scope(lms, LMS7002M::Channel::ChB);
-        reg0400_b = lms->SPI_read(0x0400, true);
-        reg040c_b = lms->SPI_read(0x040C, true);
-    }
-
-    {
-        const OpStatus write_both_status =
-            WriteAlignmentRegistersToBothChannels(lms, 0x0400, 0x8085, 0x040C, 0x01FF);
-
-        if (write_both_status != OpStatus::Success)
-        {
-            lime::warning("align: failed to write temporary RxTSP alignment registers to both channels");
-            return false;
-        }
-    }
-
-
-    //std::fprintf(stderr, "align: tsp search start\n");
-    //std::fflush(stderr);
-
-    bool aligned = false;
-    for (uint32_t iteration = 0; iteration < k_alignment_tsp_max_iterations; ++iteration)
-    {
-        {
-            LMS7002M::ChannelScope channel_scope(lms, LMS7002M::Channel::ChA);
-            lms->SPI_write(0x0020, 0x55FE, true);
-            lms->SPI_write(0x0020, 0xFFFD, true);
-        }
-
-        //const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
-        FPGA_RxDataPacket packet;
-        const bool        have_packet
-           = CaptureFreshAlignmentPacket(&packet,
-                                         std::chrono::milliseconds(150));
-        if(!have_packet) continue;
-
-        if (CheckTSPAligned(packet, checkpoint_pairs))
-        {
-            //std::fprintf(stderr, "align: tsp aligned on iteration %u\n", iteration);
-            //std::fflush(stderr);
-            aligned = true;
-            break;
-        }
-    }
-
-    if (!aligned)
-    {
-        lime::warning("align: tsp search exhausted without success");
-    }
-
-    {
-        LMS7002M::ChannelScope channel_a_scope(lms, LMS7002M::Channel::ChA);
-        lms->SPI_write(0x0400, reg0400_a, true);
-        lms->SPI_write(0x040C, reg040c_a, true);
-    }
-    {
-        LMS7002M::ChannelScope channel_b_scope(lms, LMS7002M::Channel::ChB);
-        lms->SPI_write(0x0400, reg0400_b, true);
-        lms->SPI_write(0x040C, reg040c_b, true);
-    }
-
-    return aligned;
-}
-
-void TRXLooper::ResetRxIQGeneratorAlignmentState(void)
-{
-    // Backup the original MAC to restore at the very end of the routine
-    const uint16_t caller_mac = lms->SPI_read(0x0020, true);
-
-    const LMS7002M::Channel channels_to_reset[2] =
-    {
-        LMS7002M::Channel::ChA,
-        LMS7002M::Channel::ChB
-    };
-
-    for (LMS7002M::Channel channel_value : channels_to_reset)
-    {
-        const OpStatus channel_status = lms->SetActiveChannel(channel_value);
-        if (channel_status != OpStatus::Success)
-        {
-            // Emergency restore if channel selection fails
-            lms->SPI_write(0x0020, caller_mac, true);
-            return;
-        }
-
-        // Local backup for register values that require bitwise modification
-        const uint16_t register_0020_backup = lms->SPI_read(0x0020, true);
-        const uint16_t register_010c_backup = lms->SPI_read(0x010C, true);
-        const uint16_t register_011c_backup = lms->SPI_read(0x011C, true);
-
-        // Perform the toggling sequence to reset the IQ generator state machine
-        lms->SPI_write(0x0020, 0xFFFD, true);
-        lms->SPI_write(0x011C, static_cast<uint16_t>(register_011c_backup | 0x0010), true);
-
-        lms->SPI_write(0x0020, 0xFFFF, true);
-        lms->SPI_write(0x0124, 0x001F, true);
-
-        lms->SPI_write(0x010C, static_cast<uint16_t>(register_010c_backup | 0x0008), true);
-        lms->SPI_write(0x010C, register_010c_backup, true);
-
-        lms->SPI_write(0x0020, 0xFFFD, true);
-        lms->SPI_write(0x011C, register_011c_backup, true);
-
-        // Restore the local MAC for this channel iteration
-        lms->SPI_write(0x0020, register_0020_backup, true);
-    }
-
-    // Final restoration of the MAC present before the function call
-    lms->SPI_write(0x0020, caller_mac, true);
-}
-
-alignment_bin_result TRXLooper::MeasureAlignmentBin(int bin)
-{
-    alignment_bin_result result;
+    AlignmentBinResult result;
     result.bin = bin;
     result.valid = false;
 
@@ -1125,424 +1252,6 @@ alignment_bin_result TRXLooper::MeasureAlignmentBin(int bin)
     return result;
 }
 
-double
-TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
-{
-   const alignment_bin_result result = MeasureAlignmentBin(bin);
-   if(ok) *ok = result.valid;
-   return result.phase_degrees;
-}
-
-//double TRXLooper::MeasurePhaseOffsetDeg(int bin, bool* ok)
-//{
-//    if (ok)
-//        *ok = false;
-//
-//    //const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(2u);
-//    const OpStatus prepare_status = Prepare_rx_transport_for_alignment_capture(0u);
-//    std::fprintf(stderr, "align: prepare_status=%d\n", static_cast<int>(prepare_status));
-//    std::fflush(stderr);
-//
-//    if (prepare_status != OpStatus::Success)
-//    {
-//        std::fprintf(stderr, "align: prepare failed\n");
-//        std::fflush(stderr);
-//        return 0.0;
-//    }
-//
-//    FPGA_RxDataPacket packet;
-//
-//    const bool have_packet = CaptureAlignmentPacket(&packet, std::chrono::milliseconds(50));
-//
-//   fpga->StopStreaming();
-//   mRxArgs.dma->Enable(false);
-//
-//   std::fprintf(stderr, "align: have_packet=%d\n", have_packet ? 1 : 0);
-//   std::fflush(stderr);
-//
-//   if (!have_packet)
-//   {
-//       std::fprintf(stderr, "align: no packet captured\n");
-//       std::fflush(stderr);
-//       return 0.0;
-//   }
-//
-//    std::vector<complex16_t> channel_a_samples;
-//    std::vector<complex16_t> channel_b_samples;
-//
-//    const bool deinterleave_ok =
-//    deinterleave_alignment_packet(mConfig, packet, &channel_a_samples, &channel_b_samples);
-//
-//   std::fprintf(
-//       stderr,
-//       "align: deinterleave_ok=%d payload_bytes=%u\n",
-//       deinterleave_ok ? 1 : 0,
-//       packet.GetPayloadSize() == 0
-//           ? static_cast<unsigned>(sizeof(packet.data))
-//           : packet.GetPayloadSize());
-//   std::fflush(stderr);
-//
-//   if (!deinterleave_ok)
-//       return 0.0;
-//
-//    static constexpr int dft_length = 512;
-//    const int sample_count = std::min<int>(512, static_cast<int>(channel_a_samples.size()));
-//    const complex64f_t imaginary_unit(0.0, 1.0);
-//    const double pi = std::acos(-1.0);
-//
-//    complex64f_t spectrum_a(0.0, 0.0);
-//    complex64f_t spectrum_b(0.0, 0.0);
-//    for (int sample_index = 0; sample_index < sample_count; ++sample_index)
-//    {
-//        const complex64f_t sample_a(channel_a_samples[sample_index].real(), channel_a_samples[sample_index].imag());
-//        const complex64f_t sample_b(channel_b_samples[sample_index].real(), channel_b_samples[sample_index].imag());
-//        const complex64f_t phasor = std::exp((-2.0 * imaginary_unit * pi * static_cast<double>(bin) *
-//                                                 static_cast<double>(sample_index)) /
-//            static_cast<double>(dft_length));
-//        spectrum_a += sample_a * phasor;
-//        spectrum_b += sample_b * phasor;
-//    }
-//
-//   const double power_a
-//      = compute_single_bin_power(channel_a_samples, bin, sample_count, dft_length);
-//   const double power_b
-//      = compute_single_bin_power(channel_b_samples, bin, sample_count, dft_length);
-//   double phase_degrees
-//      = std::arg(spectrum_b) * 180.0 / pi - std::arg(spectrum_a) * 180.0 / pi;
-//   while(phase_degrees < -180.0) phase_degrees += 360.0;
-//   while(phase_degrees > 180.0) phase_degrees -= 360.0;
-//   std::fprintf(stderr, "align: bin=%d phase_deg=%+.6f power_a=%.3e power_b=%.3e "
-//               "payload_bytes=%u samples=%zu\n",
-//               bin,
-//               phase_degrees,
-//               power_a,
-//               power_b,
-//               packet.GetPayloadSize() == 0
-//                  ? static_cast<unsigned>(sizeof(packet.data))
-//                  : packet.GetPayloadSize(),
-//               channel_a_samples.size());
-//   std::fflush(stderr);
-//   if(ok) *ok = true;
-//   return phase_degrees;
-//}
-
-bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_index, const std::vector<int>& bins)
-{
-    static constexpr double k_alignment_slope_power_keep_within_db = 12.0;
-    static constexpr std::size_t k_alignment_slope_min_valid_bins = 4;
-    static const double legacy_offsets[] = { 1.15 / 60.0, 1.10 / 40.0, 0.55 / 20.0, 0.20 / 10.0, 0.18 / 5.0 };
-    static const double legacy_tolerances[] = { 0.90, 0.45, 0.25, 0.14, 0.06 };
-
-    if (decimation_index < 0 || decimation_index > 4)
-        decimation_index = 0;
-
-    const double expected_phase_difference_deg = legacy_offsets[decimation_index] * sample_rate_hz / 1.0e6;
-    const double expected_slope_deg_per_bin = -expected_phase_difference_deg / 32.0;
-    const double slope_tolerance_deg_per_bin = legacy_tolerances[decimation_index] / 32.0;
-    const double residual_rms_tolerance_deg = std::max(2.0, legacy_tolerances[decimation_index] * 8.0);
-
-    std::fprintf(stderr, "align: slope search start\n");
-    std::fflush(stderr);
-
-    for (uint32_t iteration = 0; iteration < k_alignment_slope_max_iterations; ++iteration)
-    {
-        lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_FDIV_O_CGEN, 1, true);
-        lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_FDIV_O_CGEN, 0, true);
-
-        if (!AlignRxTSPRobust(k_alignment_tsp_checkpoint_pairs))
-            continue;
-
-
-        std::vector<alignment_bin_result> measured_bins;
-        measured_bins.reserve(bins.size());
-        for(int bin : bins)
-        {
-           const double tx_frequency_hz
-              = 450.0e6 + sample_rate_hz * static_cast<double>(bin) / 512.0;
-           lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
-           const alignment_bin_result result = MeasureAlignmentBin(bin);
-           if(!result.valid)
-           {
-              measured_bins.clear();
-              break;
-           }
-           measured_bins.push_back(result);
-        }
-        if(measured_bins.empty()) continue;
-        const std::vector<alignment_bin_result> filtered_bins
-           = filter_alignment_bins_by_relative_power(
-              measured_bins,
-              k_alignment_slope_power_keep_within_db);
-        if(filtered_bins.size() < k_alignment_slope_min_valid_bins) continue;
-        std::vector<int>    filtered_bin_indices;
-        std::vector<double> filtered_phase_degrees;
-        for(const alignment_bin_result& result : filtered_bins)
-        {
-           filtered_bin_indices.push_back(result.bin);
-           filtered_phase_degrees.push_back(result.phase_degrees);
-        }
-        const std::vector<double> unwrapped_phase_degrees
-           = unwrap_phase_degrees(filtered_phase_degrees);
-        double fitted_slope_deg_per_bin = 0.0;
-        double fitted_intercept_deg     = 0.0;
-        double fitted_rms_error_deg     = 0.0;
-        if(!linear_fit_phase_vs_bin(filtered_bin_indices,
-                                    unwrapped_phase_degrees,
-                                    &fitted_slope_deg_per_bin,
-                                    &fitted_intercept_deg,
-                                    &fitted_rms_error_deg))
-        {
-           continue;
-        }
-
-
-        const double slope_error_deg_per_bin =
-            std::fabs(fitted_slope_deg_per_bin - expected_slope_deg_per_bin);
-
-         std::fprintf(
-             stderr,
-             "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f phases_deg=",
-             iteration,
-             fitted_slope_deg_per_bin,
-             expected_slope_deg_per_bin,
-             slope_error_deg_per_bin,
-             fitted_rms_error_deg);
-
-         for (std::size_t phase_index = 0; phase_index < filtered_bin_indices.size(); ++phase_index)
-         {
-             std::fprintf(
-                 stderr,
-                 "%s%d:%+.6f",
-                 phase_index == 0 ? "" : ",",
-                 filtered_bin_indices[phase_index],
-                 unwrapped_phase_degrees[phase_index]);
-         }
-
-         std::fprintf(stderr, "\n");
-         std::fflush(stderr);
-
-        if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) &&
-            (fitted_rms_error_deg <= residual_rms_tolerance_deg))
-        {
-            std::fprintf(stderr, "align: slope search accepted on iteration %u\n", iteration);
-           std::fflush(stderr);
-            return true;
-        }
-    }
-
-    lime::warning("align: slope search exhausted without success");
-    return false;
-}
-
-
-bool
-TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
-{
-   const uint16_t caller_mac      = lms->SPI_read(0x0020, true);
-   auto*          register_backup = lms->BackupRegisterMap();
-   lms->SPI_write(0x0020, 0xFFFF, true);
-   lms->SPI_write(0x0113, 0x0046, true);
-   lms->SPI_write(0x0118, 0x418C, true);
-   lms->SPI_write(0x0100, 0x4039, true);
-   lms->SPI_write(0x0101, 0x7801, true);
-   lms->SPI_write(0x0108, 0x318C, true);
-   lms->SPI_write(0x0082, 0x8001, true);
-   lms->SPI_write(0x0200, 0x008D, true);
-   lms->SPI_write(0x0208, 0x01FB, true);
-   lms->SPI_write(0x0400, 0x8081, true);
-   lms->SPI_write(0x040C, 0x01FF, true);
-   lms->SPI_write(0x0404, 0x0006, true);
-   {
-      const OpStatus status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
-      if(status != OpStatus::Success)
-      {
-         if(register_backup) lms->RestoreRegisterMap(register_backup);
-         lms->SPI_write(0x0020, caller_mac, true);
-         return false;
-      }
-   }
-   lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
-   lms->SPI_write(0x0020, 0xFFFE, true);
-   lms->SPI_write(0x0105, 0x0006, true);
-   lms->SPI_write(0x0100, 0x4038, true);
-   lms->SPI_write(0x0113, 0x007F, true);
-   lms->SPI_write(0x0119, 0x529B, true);
-   uint16_t path_value
-      = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
-
-   lms->SPI_write(0x010D,
-                  path_value == 3   ? 0x018F
-                  : path_value == 2 ? 0x0117
-                                    : 0x008F,
-                  true);
-
-   lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
-   lms->SPI_write(0x0020, 0xFFFD, true);
-   lms->SPI_write(0x0103, path_value == 2 ? 0x0612 : 0x0A12, true);
-   path_value = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
-
-   lms->SPI_write(0x010D,
-                  path_value == 3   ? 0x018F
-                  : path_value == 2 ? 0x0117
-                                    : 0x008F,
-                  true);
-
-   lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
-   lms->SPI_write(0x0119, 0x5293, true);
-
-   const double sample_rate_hz
-      = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
-   const double rx_frequency_hz = lms->GetFrequencySX(TRXDir::Rx);
-   const double tx_frequency_hz = rx_frequency_hz + sample_rate_hz / 16.0;
-
-   lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
-   {
-      const OpStatus mac_restore_status
-         = lms->SetActiveChannel(LMS7002M::Channel::ChA);
-      if(mac_restore_status != OpStatus::Success)
-      {
-         if(register_backup) lms->RestoreRegisterMap(register_backup);
-         lms->SPI_write(0x0020, caller_mac, true);
-         return false;
-      }
-   }
-
-   static constexpr int dft_length = 512;
-
-   int quadrature_bin = static_cast<int>(
-      std::llround((tx_frequency_hz - rx_frequency_hz)
-                   * static_cast<double>(dft_length) / sample_rate_hz));
-
-   quadrature_bin %= dft_length;
-
-   if(quadrature_bin < 0) quadrature_bin += dft_length;
-   std::fprintf(stderr,
-                "align: forced MAC back to channel A before quadrature "
-                "search\n");
-   std::fprintf(stderr,
-                "align: quadrature search start quadrature_bin=%d "
-                "tx_minus_rx_hz=%.3f\n",
-                quadrature_bin,
-                tx_frequency_hz - rx_frequency_hz);
-   std::fflush(stderr);
-   bool aligned = false;
-   for(uint32_t iteration = 0;
-       iteration < k_alignment_quadrature_max_iterations;
-       ++iteration)
-   {
-      const alignment_bin_result result = MeasureAlignmentBin(quadrature_bin);
-      if(!result.valid)
-      {
-         ResetRxIQGeneratorAlignmentState();
-         continue;
-      }
-      const double absolute_phase_degrees = std::fabs(result.phase_degrees);
-      std::fprintf(stderr,
-                   "align: quadrature iter=%u abs_phase_deg=%.6f "
-                   "phases_deg=%d:%+.6f power_a=%.3e power_b=%.3e\n",
-                   iteration,
-                   absolute_phase_degrees,
-                   quadrature_bin,
-                   result.phase_degrees,
-                   result.power_a,
-                   result.power_b);
-      std::fflush(stderr);
-      if(absolute_phase_degrees <= accept_abs_mean_phase_deg)
-      {
-         std::fprintf(stderr,
-                      "align: quadrature accepted on iteration %u\n",
-                      iteration);
-         std::fflush(stderr);
-         aligned = true;
-         break;
-      }
-      ResetRxIQGeneratorAlignmentState();
-   }
-   if(!aligned)
-   {
-      lime::warning("align: quadrature search exhausted without success");
-   }
-   if(register_backup) lms->RestoreRegisterMap(register_backup);
-   lms->SPI_write(0x0020, caller_mac, true);
-   return aligned;
-}
-
-OpStatus TRXLooper::AlignRxPhaseInternal()
-{
-    if (!ShouldAlignRxPhase())
-        return OpStatus::Success;
-
-    const uint16_t mac_backup = lms->SPI_read(0x0020, true);
-    auto* register_backup = lms->BackupRegisterMap();
-
-    lms->SPI_write(0x0020, 0xFFFF, true);
-    lms->SPI_write(0x010C, 0x88C5, true);
-    lms->SPI_write(0x010D, 0x0117, true);
-    lms->SPI_write(0x0113, 0x024A, true);
-    lms->SPI_write(0x0118, 0x418C, true);
-    lms->SPI_write(0x0100, 0x4039, true);
-    lms->SPI_write(0x0101, 0x7801, true);
-    lms->SPI_write(0x0103, 0x0612, true);
-    lms->SPI_write(0x0108, 0x318C, true);
-    lms->SPI_write(0x0082, 0x8001, true);
-    lms->SPI_write(0x0200, 0x008D, true);
-    lms->SPI_write(0x0208, 0x01FB, true);
-    lms->SPI_write(0x0400, 0x8081, true);
-    lms->SPI_write(0x040C, 0x01FF, true);
-    lms->SPI_write(0x0404, 0x0006, true);
-
-    {
-        const OpStatus mac_restore_status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
-        if (mac_restore_status != OpStatus::Success)
-        {
-            if (register_backup)
-                lms->RestoreRegisterMap(register_backup);
-
-            lms->SPI_write(0x0020, mac_backup, true);
-            return mac_restore_status;
-        }
-    }
-    std::fprintf(stderr, "align: forced MAC back to channel A before slope search\n");
-    std::fflush(stderr);
-
-    lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
-
-    const double sample_rate_hz = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
-    lms->SetFrequencySX(TRXDir::Rx, 450.0e6);
-
-    int decimation_index = lms->Get_SPI_Reg_bits(LMS7002MCSR::HBD_OVR_RXTSP, true);
-    if (decimation_index > 4)
-        decimation_index = 0;
-
-    std::fprintf(stderr, 
-        "align: slope search sample_rate_hz=%.3f decimation_index=%d\n",
-        sample_rate_hz,
-        decimation_index);
-    std::fflush(stderr);
-
-    const std::vector<int> slope_bins = { 16, 24, 32, 40, 48, 56, 64 };
-    const bool slope_state_ok = SearchRxPhaseSlopeState(sample_rate_hz, decimation_index, slope_bins);
-
-    if (register_backup)
-        lms->RestoreRegisterMap(register_backup);
-
-    lms->SPI_write(0x0020, mac_backup, true);
-
-    if (!slope_state_ok)
-    {
-        lime::warning("Rx phase alignment failed during slope-state search");
-        return OpStatus::Error;
-    }
-
-    const bool quadrature_ok = AlignQuadratureRobust(k_alignment_quadrature_accept_mean_deg);
-    if (!quadrature_ok)
-    {
-        lime::warning("Rx phase alignment failed during quadrature-state search");
-        return OpStatus::Error;
-    }
-
-    return OpStatus::Success;
-}
 
 /// @brief Sets up the stream of this looper.
 /// @param cfg The configuration settings to set up the stream with.
