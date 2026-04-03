@@ -1334,135 +1334,127 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
     return false;
 }
 
-bool TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
+
+bool
+TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
 {
-    const uint16_t caller_mac = lms->spi_read(0x0020, true);
-    auto* register_backup = lms->backup_register_map();
-
-    // Initial hardware setup block
-    lms->spi_write(0x0020, 0xFFFF, true);
-    lms->spi_write(0x0113, 0x0046, true);
-    lms->spi_write(0x0118, 0x418C, true);
-    lms->spi_write(0x0100, 0x4039, true);
-    lms->spi_write(0x0101, 0x7801, true);
-    lms->spi_write(0x0108, 0x318C, true);
-    lms->spi_write(0x0082, 0x8001, true);
-    lms->spi_write(0x0200, 0x008D, true);
-    lms->spi_write(0x0208, 0x01FB, true);
-    lms->spi_write(0x0400, 0x8081, true);
-    lms->spi_write(0x040C, 0x01FF, true);
-    lms->spi_write(0x0404, 0x0006, true);
-
-    {
-        const op_status status = lms->set_active_channel(lms7002m::channel::ch_a);
-        if (status != op_status::success)
-        {
-            if (register_backup)
-            {
-                lms->restore_register_map(register_backup);
-            }
-            lms->spi_write(0x0020, caller_mac, true);
-            return false;
-        }
-    }
-
-    lms->load_dc_reg_iq(trx_dir::tx, 0x3FFF, 0x3FFF);
-
-    // Path-specific configuration block
-    lms->spi_write(0x0020, 0xFFFE, true);
-    lms->spi_write(0x0105, 0x0006, true);
-    lms->spi_write(0x0100, 0x4038, true);
-    lms->spi_write(0x0113, 0x007F, true);
-    lms->spi_write(0x0119, 0x529B, true);
-
-    uint16_t path_value = lms->get_spi_reg_bits(lms7002mcsr::sel_path_rfe, true);
-    lms->spi_write(0x010D, path_value == 3 ? 0x018F : path_value == 2 ? 0x0117 : 0x008F, true);
-    lms->spi_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
-
-    lms->spi_write(0x0020, 0xFFFD, true);
-    lms->spi_write(0x0103, path_value == 2 ? 0x0612 : 0x0A12, true);
-
-    path_value = lms->get_spi_reg_bits(lms7002mcsr::sel_path_rfe, true);
-    lms->spi_write(0x010D, path_value == 3 ? 0x018F : path_value == 2 ? 0x0117 : 0x008F, true);
-    lms->spi_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
-    lms->spi_write(0x0119, 0x5293, true);
-
-    const double sample_rate_hz = lms->get_sample_rate(trx_dir::rx, lms7002m::channel::ch_a);
-    const double rx_frequency_hz = lms->get_frequency_sx(trx_dir::rx);
-    const double tx_frequency_hz = rx_frequency_hz + (sample_rate_hz / 16.0);
-
-    lms->set_frequency_sx(trx_dir::tx, tx_frequency_hz);
-
-    {
-        const op_status mac_restore_status = lms->set_active_channel(lms7002m::channel::ch_a);
-        if (mac_restore_status != op_status::success)
-        {
-            if (register_backup)
-            {
-                lms->restore_register_map(register_backup);
-            }
-            lms->spi_write(0x0020, caller_mac, true);
-            return false;
-        }
-    }
-
-    static constexpr int dft_length = 512;
-    int quadrature_bin = static_cast<int>(
-        std::llround((tx_frequency_hz - rx_frequency_hz) * static_cast<double>(dft_length) / sample_rate_hz));
-
-    quadrature_bin %= dft_length;
-    if (quadrature_bin < 0)
-    {
-        quadrature_bin += dft_length;
-    }
-
-    std::fprintf(stderr, "align: forced MAC back to channel A before quadrature search\n");
-    std::fprintf(stderr, "align: quadrature search start quadrature_bin=%d tx_minus_rx_hz=%.3f\n",
-                 quadrature_bin, tx_frequency_hz - rx_frequency_hz);
-    std::fflush(stderr);
-
-    bool aligned = false;
-    for (uint32_t iteration = 0; iteration < k_alignment_quadrature_max_iterations; ++iteration)
-    {
-        const alignment_bin_result result = measure_alignment_bin(quadrature_bin);
-
-        if (!result.valid)
-        {
-            reset_rx_iq_generator_alignment_state();
-            continue;
-        }
-
-        const double absolute_phase_degrees = std::fabs(result.phase_degrees);
-
-        std::fprintf(stderr,
-                     "align: quadrature iter=%u abs_phase_deg=%.6f phases_deg=%d:%+.6f power_a=%.3e power_b=%.3e\n",
-                     iteration, absolute_phase_degrees, quadrature_bin,
-                     result.phase_degrees, result.power_a, result.power_b);
-        std::fflush(stderr);
-
-        if (absolute_phase_degrees <= accept_abs_mean_phase_deg)
-        {
-            std::fprintf(stderr, "align: quadrature accepted on iteration %u\n", iteration);
-            std::fflush(stderr);
-            aligned = true;
-            break;
-        }
-
-        reset_rx_iq_generator_alignment_state();
-    }
-
-    if (!aligned)
-    {
-        lime::warning("align: quadrature search exhausted without success");
-    }
-
-    if (register_backup)
-    {
-        lms->restore_register_map(register_backup);
-    }
-
-    lms->spi_write(0x0020, caller_mac, true);
-    return aligned;
+   const uint16_t caller_mac      = lms->SPI_read(0x0020, true);
+   auto*          register_backup = lms->BackupRegisterMap();
+   lms->SPI_write(0x0020, 0xFFFF, true);
+   lms->SPI_write(0x0113, 0x0046, true);
+   lms->SPI_write(0x0118, 0x418C, true);
+   lms->SPI_write(0x0100, 0x4039, true);
+   lms->SPI_write(0x0101, 0x7801, true);
+   lms->SPI_write(0x0108, 0x318C, true);
+   lms->SPI_write(0x0082, 0x8001, true);
+   lms->SPI_write(0x0200, 0x008D, true);
+   lms->SPI_write(0x0208, 0x01FB, true);
+   lms->SPI_write(0x0400, 0x8081, true);
+   lms->SPI_write(0x040C, 0x01FF, true);
+   lms->SPI_write(0x0404, 0x0006, true);
+   {
+      const OpStatus status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+      if(status != OpStatus::Success)
+      {
+         if(register_backup) lms->RestoreRegisterMap(register_backup);
+         lms->SPI_write(0x0020, caller_mac, true);
+         return false;
+      }
+   }
+   lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+   lms->SPI_write(0x0020, 0xFFFE, true);
+   lms->SPI_write(0x0105, 0x0006, true);
+   lms->SPI_write(0x0100, 0x4038, true);
+   lms->SPI_write(0x0113, 0x007F, true);
+   lms->SPI_write(0x0119, 0x529B, true);
+   uint16_t path_value
+      = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
+   lms->SPI_write(0x010D,
+                  path_value == 3   ? 0x018F
+                  : path_value == 2 ? 0x0117
+                                    : 0x008F,
+                  true);
+   lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
+   lms->SPI_write(0x0020, 0xFFFD, true);
+   lms->SPI_write(0x0103, path_value == 2 ? 0x0612 : 0x0A12, true);
+   path_value = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
+   lms->SPI_write(0x010D,
+                  path_value == 3   ? 0x018F
+                  : path_value == 2 ? 0x0117
+                                    : 0x008F,
+                  true);
+   lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
+   lms->SPI_write(0x0119, 0x5293, true);
+   const double sample_rate_hz
+      = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
+   const double rx_frequency_hz = lms->GetFrequencySX(TRXDir::Rx);
+   const double tx_frequency_hz = rx_frequency_hz + sample_rate_hz / 16.0;
+   lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
+   {
+      const OpStatus mac_restore_status
+         = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+      if(mac_restore_status != OpStatus::Success)
+      {
+         if(register_backup) lms->RestoreRegisterMap(register_backup);
+         lms->SPI_write(0x0020, caller_mac, true);
+         return false;
+      }
+   }
+   static constexpr int dft_length     = 512;
+   int                  quadrature_bin = static_cast<int>(
+      std::llround((tx_frequency_hz - rx_frequency_hz)
+                   * static_cast<double>(dft_length) / sample_rate_hz));
+   quadrature_bin %= dft_length;
+   if(quadrature_bin < 0) quadrature_bin += dft_length;
+   std::fprintf(stderr,
+                "align: forced MAC back to channel A before quadrature "
+                "search\n");
+   std::fprintf(stderr,
+                "align: quadrature search start quadrature_bin=%d "
+                "tx_minus_rx_hz=%.3f\n",
+                quadrature_bin,
+                tx_frequency_hz - rx_frequency_hz);
+   std::fflush(stderr);
+   bool aligned = false;
+   for(uint32_t iteration = 0;
+       iteration < k_alignment_quadrature_max_iterations;
+       ++iteration)
+   {
+      const alignment_bin_result result = MeasureAlignmentBin(quadrature_bin);
+      if(!result.valid)
+      {
+         ResetRxIQGeneratorAlignmentState();
+         continue;
+      }
+      const double absolute_phase_degrees = std::fabs(result.phase_degrees);
+      std::fprintf(stderr,
+                   "align: quadrature iter=%u abs_phase_deg=%.6f "
+                   "phases_deg=%d:%+.6f power_a=%.3e power_b=%.3e\n",
+                   iteration,
+                   absolute_phase_degrees,
+                   quadrature_bin,
+                   result.phase_degrees,
+                   result.power_a,
+                   result.power_b);
+      std::fflush(stderr);
+      if(absolute_phase_degrees <= accept_abs_mean_phase_deg)
+      {
+         std::fprintf(stderr,
+                      "align: quadrature accepted on iteration %u\n",
+                      iteration);
+         std::fflush(stderr);
+         aligned = true;
+         break;
+      }
+      ResetRxIQGeneratorAlignmentState();
+   }
+   if(!aligned)
+   {
+      lime::warning("align: quadrature search exhausted without success");
+   }
+   if(register_backup) lms->RestoreRegisterMap(register_backup);
+   lms->SPI_write(0x0020, caller_mac, true);
+   return aligned;
 }
 
 OpStatus TRXLooper::AlignRxPhaseInternal()
