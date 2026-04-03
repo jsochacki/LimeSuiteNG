@@ -38,8 +38,8 @@ static constexpr int statsPeriod_ms{ 1000 }; // at 122.88 MHz MIMO, fpga tx pkt 
 static constexpr uint32_t k_alignment_tsp_checkpoint_pairs = 8;
 static constexpr uint32_t k_alignment_tsp_max_iterations = 128;
 static constexpr uint32_t k_alignment_slope_max_iterations = 256;
-static constexpr uint32_t k_alignment_quadrature_max_iterations = 128;
-static constexpr double k_alignment_quadrature_accept_mean_deg = 25.0;
+static constexpr uint32_t k_alignment_quadrature_max_iterations = 32;
+static constexpr double k_alignment_quadrature_accept_mean_deg = 89.0;
 
 static_assert(offsetof(FPGA_RxDataPacket, header0) == 0, "unexpected FPGA_RxDataPacket layout");
 static_assert(offsetof(FPGA_RxDataPacket, payloadSizeLSB) == 1, "unexpected FPGA_RxDataPacket layout");
