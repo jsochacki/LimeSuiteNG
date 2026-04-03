@@ -39,7 +39,7 @@ static constexpr uint32_t k_alignment_tsp_checkpoint_pairs = 8;
 static constexpr uint32_t k_alignment_tsp_max_iterations = 128;
 static constexpr uint32_t k_alignment_slope_max_iterations = 256;
 static constexpr uint32_t k_alignment_quadrature_max_iterations = 128;
-static constexpr double k_alignment_quadrature_accept_mean_deg = 45.0;
+static constexpr double k_alignment_quadrature_accept_mean_deg = 25.0;
 
 static_assert(offsetof(FPGA_RxDataPacket, header0) == 0, "unexpected FPGA_RxDataPacket layout");
 static_assert(offsetof(FPGA_RxDataPacket, payloadSizeLSB) == 1, "unexpected FPGA_RxDataPacket layout");
@@ -1369,26 +1369,32 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
    lms->SPI_write(0x0119, 0x529B, true);
    uint16_t path_value
       = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
+
    lms->SPI_write(0x010D,
                   path_value == 3   ? 0x018F
                   : path_value == 2 ? 0x0117
                                     : 0x008F,
                   true);
+
    lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
    lms->SPI_write(0x0020, 0xFFFD, true);
    lms->SPI_write(0x0103, path_value == 2 ? 0x0612 : 0x0A12, true);
    path_value = lms->Get_SPI_Reg_bits(LMS7002MCSR::SEL_PATH_RFE, true);
+
    lms->SPI_write(0x010D,
                   path_value == 3   ? 0x018F
                   : path_value == 2 ? 0x0117
                                     : 0x008F,
                   true);
+
    lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
    lms->SPI_write(0x0119, 0x5293, true);
+
    const double sample_rate_hz
       = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
    const double rx_frequency_hz = lms->GetFrequencySX(TRXDir::Rx);
    const double tx_frequency_hz = rx_frequency_hz + sample_rate_hz / 16.0;
+
    lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
    {
       const OpStatus mac_restore_status
@@ -1400,11 +1406,15 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
          return false;
       }
    }
-   static constexpr int dft_length     = 512;
-   int                  quadrature_bin = static_cast<int>(
+
+   static constexpr int dft_length = 512;
+
+   int quadrature_bin = static_cast<int>(
       std::llround((tx_frequency_hz - rx_frequency_hz)
                    * static_cast<double>(dft_length) / sample_rate_hz));
+
    quadrature_bin %= dft_length;
+
    if(quadrature_bin < 0) quadrature_bin += dft_length;
    std::fprintf(stderr,
                 "align: forced MAC back to channel A before quadrature "
