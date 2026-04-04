@@ -467,12 +467,15 @@ OpStatus TRXLooper::AlignRxPhaseInternal()
         return OpStatus::Error;
     }
 
-    const bool quadrature_ok = AlignQuadratureRobust(k_alignment_quadrature_accept_mean_deg);
-    if (!quadrature_ok)
-    {
-        lime::warning("Rx phase alignment failed during quadrature-state search");
-        return OpStatus::Error;
-    }
+    //Currently there is no way to fix the quadrature due to the fact that
+    //channels A and B have independent sources and they have and UP and Down
+    //mix in their paths each with their own IQ generator circuit
+//    const bool quadrature_ok = AlignQuadratureRobust(k_alignment_quadrature_accept_mean_deg);
+//    if (!quadrature_ok)
+//    {
+//        lime::warning("Rx phase alignment failed during quadrature-state search");
+//        return OpStatus::Error;
+//    }
 
     return OpStatus::Success;
 }
@@ -582,9 +585,6 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
     const double slope_tolerance_deg_per_bin = legacy_tolerances[decimation_index] / 32.0;
     const double residual_rms_tolerance_deg = std::max(2.0, legacy_tolerances[decimation_index] * 8.0);
 
-    std::fprintf(stderr, "align: slope search start\n");
-    std::fflush(stderr);
-
     for (uint32_t iteration = 0; iteration < k_alignment_slope_max_iterations; ++iteration)
     {
         lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_FDIV_O_CGEN, 1, true);
@@ -666,7 +666,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
             (fitted_rms_error_deg <= residual_rms_tolerance_deg))
         {
             std::fprintf(stderr, "align: slope search accepted on iteration %u\n", iteration);
-           std::fflush(stderr);
+            std::fflush(stderr);
             return true;
         }
     }
