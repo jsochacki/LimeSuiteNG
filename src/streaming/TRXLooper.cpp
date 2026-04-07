@@ -840,37 +840,6 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
       }
    }
 
-   {
-      const uint16_t mac_before_probe = lms->SPI_read(0x0020, true);
-
-      const AlignmentBinResult tx_a_only_probe = MeasureAlignmentBin(quadrature_bin);
-
-      lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_A, 0, true);
-      lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_B, 1, true);
-      lms->SetActiveChannel(LMS7002M::Channel::ChB);
-      lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 1, true);
-      lms->Modify_SPI_Reg_bits(LMS7002MCSR::INSEL_TXTSP, 1, true);
-      lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
-      lms->SetActiveChannel(LMS7002M::Channel::ChA);
-      lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 0, true);
-      lms->LoadDC_REG_IQ(TRXDir::Tx, 0, 0);
-      lms->SetActiveChannel(LMS7002M::Channel::ChA);
-
-      const AlignmentBinResult tx_b_only_probe = MeasureAlignmentBin(quadrature_bin);
-
-      std::fprintf(stderr,
-                   "align: source probe tx_a_only power_a=%.3e power_b=%.3e ; "
-                   "tx_b_only power_a=%.3e power_b=%.3e\n",
-                   tx_a_only_probe.power_a,
-                   tx_a_only_probe.power_b,
-                   tx_b_only_probe.power_a,
-                   tx_b_only_probe.power_b);
-      std::fflush(stderr);
-
-      lms->SPI_write(0x0020, mac_before_probe, true);
-      configure_quadrature_alignment_single_tx_source(lms);
-   }
-
    const double sample_rate_hz
       = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
    const double rx_frequency_hz = lms->GetFrequencySX(TRXDir::Rx);
@@ -910,6 +879,40 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
                 "weak RXB captures are intentionally not rejected\n");
    std::fflush(stderr);
    bool aligned = false;
+
+
+   {
+      const uint16_t mac_before_probe = lms->SPI_read(0x0020, true);
+
+      const AlignmentBinResult tx_a_only_probe = MeasureAlignmentBin(quadrature_bin);
+
+      lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_A, 0, true);
+      lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_B, 1, true);
+      lms->SetActiveChannel(LMS7002M::Channel::ChB);
+      lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 1, true);
+      lms->Modify_SPI_Reg_bits(LMS7002MCSR::INSEL_TXTSP, 1, true);
+      lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+      lms->SetActiveChannel(LMS7002M::Channel::ChA);
+      lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 0, true);
+      lms->LoadDC_REG_IQ(TRXDir::Tx, 0, 0);
+      lms->SetActiveChannel(LMS7002M::Channel::ChA);
+
+      const AlignmentBinResult tx_b_only_probe = MeasureAlignmentBin(quadrature_bin);
+
+      std::fprintf(stderr,
+                   "align: source probe tx_a_only power_a=%.3e power_b=%.3e ; "
+                   "tx_b_only power_a=%.3e power_b=%.3e\n",
+                   tx_a_only_probe.power_a,
+                   tx_a_only_probe.power_b,
+                   tx_b_only_probe.power_a,
+                   tx_b_only_probe.power_b);
+      std::fflush(stderr);
+
+      lms->SPI_write(0x0020, mac_before_probe, true);
+      configure_quadrature_alignment_single_tx_source(lms);
+   }
+
+
    for(uint32_t iteration = 0;
        iteration < k_alignment_quadrature_max_iterations;
        ++iteration)
