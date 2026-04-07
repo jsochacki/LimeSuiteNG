@@ -269,17 +269,46 @@ filter_alignment_bins_by_relative_power(
 static OpStatus
 configure_quadrature_alignment_single_tx_source(LMS7002M* lms)
 {
-   OpStatus status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+   /*
+    * First do the strongest possible top-level gating:
+    * keep TXA enabled, force TXB disabled.
+    *
+    * Even if downstream B-path blocks are muted, leaving TXEN_B high still
+    * allows the channel-B transmit side to remain logically active.
+    */
+   OpStatus status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_A, 1, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_B, 0, true);
+   if(status != OpStatus::Success) return status;
+
+   /*
+    * Leave both RX channels alive.
+    */
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::RXEN_A, 1, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::RXEN_B, 1, true);
+   if(status != OpStatus::Success) return status;
+
+
+   status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
    if(status != OpStatus::Success) return status;
 
    /*
     * Channel A is the only intentional transmitter during quadrature search.
-    * Drive its TxTSP DC source hard and make sure its TX chain is not powered down.
+    * Drive its TxTSP internal source hard and make sure its TX chain is active.
     */
    status = lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
    if(status != OpStatus::Success) return status;
 
    status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 1, true);
+   if(status != OpStatus::Success) return status;
+
+   /*
+    * Be explicit about using the internal TxTSP source on A.
+    */
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::INSEL_TXTSP, 1, true);
    if(status != OpStatus::Success) return status;
 
    status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TBB, 1, true);
@@ -299,10 +328,12 @@ configure_quadrature_alignment_single_tx_source(LMS7002M* lms)
 
    /*
     * Channel B must not act as a second ambiguous transmitter.
-    * Zero its TxTSP DC source and power down / mute the B TX path.
-    *
-    * The important point is that RXB stays alive for measurement, but TXB is
-    * intentionally silenced so both receivers only observe leakage from TXA.
+    * Disable it at every practical layer:
+    *   1) top-level TXEN_B
+    *   2) TxTSP disable
+    *   3) move TxTSP input away from internal test source
+    *   4) zero DC register
+    *   5) power down DAC / TBB / TRF side pieces
     */
    status = lms->SetActiveChannel(LMS7002M::Channel::ChB);
    if(status != OpStatus::Success) return status;
@@ -311,6 +342,9 @@ configure_quadrature_alignment_single_tx_source(LMS7002M* lms)
    if(status != OpStatus::Success) return status;
 
    status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 0, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::INSEL_TXTSP, 0, true);
    if(status != OpStatus::Success) return status;
 
    status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TBB, 0, true);
@@ -804,6 +838,37 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
          lms->SPI_write(0x0020, caller_mac, true);
          return false;
       }
+   }
+
+   {
+      const uint16_t mac_before_probe = lms->SPI_read(0x0020, true);
+
+      const AlignmentBinResult tx_a_only_probe = MeasureAlignmentBin(quadrature_bin);
+
+      lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_A, 0, true);
+      lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_B, 1, true);
+      lms->SetActiveChannel(LMS7002M::Channel::ChB);
+      lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 1, true);
+      lms->Modify_SPI_Reg_bits(LMS7002MCSR::INSEL_TXTSP, 1, true);
+      lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+      lms->SetActiveChannel(LMS7002M::Channel::ChA);
+      lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 0, true);
+      lms->LoadDC_REG_IQ(TRXDir::Tx, 0, 0);
+      lms->SetActiveChannel(LMS7002M::Channel::ChA);
+
+      const AlignmentBinResult tx_b_only_probe = MeasureAlignmentBin(quadrature_bin);
+
+      std::fprintf(stderr,
+                   "align: source probe tx_a_only power_a=%.3e power_b=%.3e ; "
+                   "tx_b_only power_a=%.3e power_b=%.3e\n",
+                   tx_a_only_probe.power_a,
+                   tx_a_only_probe.power_b,
+                   tx_b_only_probe.power_a,
+                   tx_b_only_probe.power_b);
+      std::fflush(stderr);
+
+      lms->SPI_write(0x0020, mac_before_probe, true);
+      configure_quadrature_alignment_single_tx_source(lms);
    }
 
    const double sample_rate_hz
