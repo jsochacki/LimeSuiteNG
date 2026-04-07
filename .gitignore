@@ -33,3 +33,5 @@ docs/LMS_API_Documentation/*
 
 # Vim View Files
 .*.view
+
+.cache

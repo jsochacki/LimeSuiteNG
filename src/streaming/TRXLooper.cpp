@@ -266,6 +266,71 @@ filter_alignment_bins_by_relative_power(
    return filtered_results;
 }
 
+static OpStatus
+configure_quadrature_alignment_single_tx_source(LMS7002M* lms)
+{
+   OpStatus status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+   if(status != OpStatus::Success) return status;
+
+   /*
+    * Channel A is the only intentional transmitter during quadrature search.
+    * Drive its TxTSP DC source hard and make sure its TX chain is not powered down.
+    */
+   status = lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 1, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TBB, 1, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TRF, 1, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TLOBUF_TRF, 0, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TXPAD_TRF, 0, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TX_AFE1, 0, true);
+   if(status != OpStatus::Success) return status;
+
+   /*
+    * Channel B must not act as a second ambiguous transmitter.
+    * Zero its TxTSP DC source and power down / mute the B TX path.
+    *
+    * The important point is that RXB stays alive for measurement, but TXB is
+    * intentionally silenced so both receivers only observe leakage from TXA.
+    */
+   status = lms->SetActiveChannel(LMS7002M::Channel::ChB);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->LoadDC_REG_IQ(TRXDir::Tx, 0, 0);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 0, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TBB, 0, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TRF, 0, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TLOBUF_TRF, 1, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TXPAD_TRF, 1, true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TX_AFE2, 1, true);
+   if(status != OpStatus::Success) return status;
+
+   return lms->SetActiveChannel(LMS7002M::Channel::ChA);
+}
+
 } // namespace
 
 static struct tm ReadUTC(FPGA* fpga, uint16_t base)
@@ -470,12 +535,12 @@ OpStatus TRXLooper::AlignRxPhaseInternal()
     //Currently there is no way to fix the quadrature due to the fact that
     //channels A and B have independent sources and they have and UP and Down
     //mix in their paths each with their own IQ generator circuit
-//    const bool quadrature_ok = AlignQuadratureRobust(k_alignment_quadrature_accept_mean_deg);
-//    if (!quadrature_ok)
-//    {
-//        lime::warning("Rx phase alignment failed during quadrature-state search");
-//        return OpStatus::Error;
-//    }
+    const bool quadrature_ok = AlignQuadratureRobust(k_alignment_quadrature_accept_mean_deg);
+    if (!quadrature_ok)
+    {
+        lime::warning("Rx phase alignment failed during quadrature-state search");
+        return OpStatus::Error;
+    }
 
     return OpStatus::Success;
 }
@@ -730,6 +795,17 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
    lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
    lms->SPI_write(0x0119, 0x5293, true);
 
+   {
+      const OpStatus single_source_status
+         = configure_quadrature_alignment_single_tx_source(lms);
+      if(single_source_status != OpStatus::Success)
+      {
+         if(register_backup) lms->RestoreRegisterMap(register_backup);
+         lms->SPI_write(0x0020, caller_mac, true);
+         return false;
+      }
+   }
+
    const double sample_rate_hz
       = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
    const double rx_frequency_hz = lms->GetFrequencySX(TRXDir::Rx);
@@ -764,6 +840,9 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
                 "tx_minus_rx_hz=%.3f\n",
                 quadrature_bin,
                 tx_frequency_hz - rx_frequency_hz);
+   std::fprintf(stderr,
+                "align: quadrature using TXA-only leakage source; "
+                "weak RXB captures are intentionally not rejected\n");
    std::fflush(stderr);
    bool aligned = false;
    for(uint32_t iteration = 0;
@@ -776,6 +855,10 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
          ResetRxIQGeneratorAlignmentState();
          continue;
       }
+      /*
+       * Do not add a minimum-power gate on channel B here.
+       * In this mode RXB may only see TXA leakage and still carries usable phase.
+       */
       const double absolute_phase_degrees = std::fabs(result.phase_degrees);
       std::fprintf(stderr,
                    "align: quadrature iter=%u abs_phase_deg=%.6f "
