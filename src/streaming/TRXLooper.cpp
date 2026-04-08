@@ -51,26 +51,43 @@ static_assert(sizeof(FPGA_RxDataPacket) == 4096, "unexpected FPGA_RxDataPacket s
 
 namespace {
 
-std::vector<double> unwrap_phase_degrees(const std::vector<double>& wrapped_phase_degrees)
+static double fold_phase_degrees_mod_180(double phase_degrees)
+{
+    while (phase_degrees >= 90.0)
+        phase_degrees -= 180.0;
+
+    while (phase_degrees < -90.0)
+        phase_degrees += 180.0;
+
+    return phase_degrees;
+}
+
+static std::vector<double> unwrap_phase_degrees_mod_180(
+    const std::vector<double>& wrapped_phase_degrees)
 {
     std::vector<double> unwrapped_phase_degrees = wrapped_phase_degrees;
     if (unwrapped_phase_degrees.empty())
         return unwrapped_phase_degrees;
 
+    unwrapped_phase_degrees[0] =
+        fold_phase_degrees_mod_180(unwrapped_phase_degrees[0]);
+
     for (std::size_t index = 1; index < unwrapped_phase_degrees.size(); ++index)
     {
-        double phase_delta_degrees = unwrapped_phase_degrees[index] - unwrapped_phase_degrees[index - 1];
-        while (phase_delta_degrees > 180.0)
-        {
-            unwrapped_phase_degrees[index] -= 360.0;
-            phase_delta_degrees -= 360.0;
-        }
-        while (phase_delta_degrees < -180.0)
-        {
-            unwrapped_phase_degrees[index] += 360.0;
-            phase_delta_degrees += 360.0;
-        }
+        double phase_value =
+            fold_phase_degrees_mod_180(unwrapped_phase_degrees[index]);
+
+        const double previous_value = unwrapped_phase_degrees[index - 1];
+
+        while ((phase_value - previous_value) > 90.0)
+            phase_value -= 180.0;
+
+        while ((phase_value - previous_value) < -90.0)
+            phase_value += 180.0;
+
+        unwrapped_phase_degrees[index] = phase_value;
     }
+
     return unwrapped_phase_degrees;
 }
 
@@ -266,100 +283,109 @@ filter_alignment_bins_by_relative_power(
    return filtered_results;
 }
 
-static OpStatus
-configure_quadrature_alignment_single_tx_source(LMS7002M* lms)
+static const char*
+alignment_channel_name(LMS7002M::Channel channel)
 {
-   /*
-    * First do the strongest possible top-level gating:
-    * keep TXA enabled, force TXB disabled.
-    *
-    * Even if downstream B-path blocks are muted, leaving TXEN_B high still
-    * allows the channel-B transmit side to remain logically active.
-    */
-   OpStatus status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_A, 1, true);
+   return channel == LMS7002M::Channel::ChA ? "A" : "B";
+}
+
+static double
+quadrature_probe_score(const AlignmentBinResult& result)
+{
+   return std::min(result.power_a, result.power_b);
+}
+
+static OpStatus
+configure_quadrature_alignment_tx_path_state(LMS7002M*         lms,
+                                             LMS7002M::Channel channel,
+                                             bool              enable_source)
+{
+   OpStatus status = lms->SetActiveChannel(channel);
    if(status != OpStatus::Success) return status;
 
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_B, 0, true);
+   status = lms->LoadDC_REG_IQ(TRXDir::Tx,
+                               enable_source ? 0x3FFF : 0x0000,
+                               enable_source ? 0x3FFF : 0x0000);
    if(status != OpStatus::Success) return status;
 
-   /*
-    * Leave both RX channels alive.
-    */
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP,
+                                     enable_source ? 1 : 0,
+                                     true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::INSEL_TXTSP,
+                                     enable_source ? 1 : 0,
+                                     true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TBB,
+                                     enable_source ? 1 : 0,
+                                     true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TRF,
+                                     enable_source ? 1 : 0,
+                                     true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TLOBUF_TRF,
+                                     enable_source ? 0 : 1,
+                                     true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TXPAD_TRF,
+                                     enable_source ? 0 : 1,
+                                     true);
+
+   if(status != OpStatus::Success) return status;
+   return OpStatus::Success;
+}
+
+
+static OpStatus
+configure_quadrature_alignment_tx_source(LMS7002M*         lms,
+                                         LMS7002M::Channel source_channel)
+{
+   OpStatus status = lms->Modify_SPI_Reg_bits(
+      LMS7002MCSR::TXEN_A,
+      source_channel == LMS7002M::Channel::ChA ? 1 : 0,
+      true);
+   if(status != OpStatus::Success) return status;
+
+   status = lms->Modify_SPI_Reg_bits(
+      LMS7002MCSR::TXEN_B,
+      source_channel == LMS7002M::Channel::ChB ? 1 : 0,
+      true);
+   if(status != OpStatus::Success) return status;
+
    status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::RXEN_A, 1, true);
    if(status != OpStatus::Success) return status;
 
    status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::RXEN_B, 1, true);
    if(status != OpStatus::Success) return status;
 
-
-   status = lms->SetActiveChannel(LMS7002M::Channel::ChA);
+   status = lms->Modify_SPI_Reg_bits(
+      LMS7002MCSR::PD_TX_AFE1,
+      source_channel == LMS7002M::Channel::ChA ? 0 : 1,
+      true);
    if(status != OpStatus::Success) return status;
 
-   /*
-    * Channel A is the only intentional transmitter during quadrature search.
-    * Drive its TxTSP internal source hard and make sure its TX chain is active.
-    */
-   status = lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
+   status = lms->Modify_SPI_Reg_bits(
+      LMS7002MCSR::PD_TX_AFE2,
+      source_channel == LMS7002M::Channel::ChB ? 0 : 1,
+      true);
    if(status != OpStatus::Success) return status;
 
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 1, true);
+   status = configure_quadrature_alignment_tx_path_state(
+      lms,
+      LMS7002M::Channel::ChA,
+      source_channel == LMS7002M::Channel::ChA);
    if(status != OpStatus::Success) return status;
 
-   /*
-    * Be explicit about using the internal TxTSP source on A.
-    */
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::INSEL_TXTSP, 1, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TBB, 1, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TRF, 1, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TLOBUF_TRF, 0, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TXPAD_TRF, 0, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TX_AFE1, 0, true);
-   if(status != OpStatus::Success) return status;
-
-   /*
-    * Channel B must not act as a second ambiguous transmitter.
-    * Disable it at every practical layer:
-    *   1) top-level TXEN_B
-    *   2) TxTSP disable
-    *   3) move TxTSP input away from internal test source
-    *   4) zero DC register
-    *   5) power down DAC / TBB / TRF side pieces
-    */
-   status = lms->SetActiveChannel(LMS7002M::Channel::ChB);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->LoadDC_REG_IQ(TRXDir::Tx, 0, 0);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 0, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::INSEL_TXTSP, 0, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TBB, 0, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_G_TRF, 0, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TLOBUF_TRF, 1, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TXPAD_TRF, 1, true);
-   if(status != OpStatus::Success) return status;
-
-   status = lms->Modify_SPI_Reg_bits(LMS7002MCSR::PD_TX_AFE2, 1, true);
+   status = configure_quadrature_alignment_tx_path_state(
+      lms,
+      LMS7002M::Channel::ChB,
+      source_channel == LMS7002M::Channel::ChB);
    if(status != OpStatus::Success) return status;
 
    return lms->SetActiveChannel(LMS7002M::Channel::ChA);
@@ -722,7 +748,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
            filtered_phase_degrees.push_back(result.phase_degrees);
         }
         const std::vector<double> unwrapped_phase_degrees
-           = unwrap_phase_degrees(filtered_phase_degrees);
+           = unwrap_phase_degrees_mod_180(filtered_phase_degrees);
         double fitted_slope_deg_per_bin = 0.0;
         double fitted_intercept_deg     = 0.0;
         double fitted_rms_error_deg     = 0.0;
@@ -741,7 +767,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
 
          std::fprintf(
              stderr,
-             "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f phases_deg=",
+             "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f phases_deg_mod180=",
              iteration,
              fitted_slope_deg_per_bin,
              expected_slope_deg_per_bin,
@@ -829,16 +855,6 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
    lms->SPI_write(0x010C, path_value == 2 ? 0x88C5 : 0x88A5, true);
    lms->SPI_write(0x0119, 0x5293, true);
 
-   {
-      const OpStatus single_source_status
-         = configure_quadrature_alignment_single_tx_source(lms);
-      if(single_source_status != OpStatus::Success)
-      {
-         if(register_backup) lms->RestoreRegisterMap(register_backup);
-         lms->SPI_write(0x0020, caller_mac, true);
-         return false;
-      }
-   }
 
    const double sample_rate_hz
       = lms->GetSampleRate(TRXDir::Rx, LMS7002M::Channel::ChA);
@@ -874,42 +890,91 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
                 "tx_minus_rx_hz=%.3f\n",
                 quadrature_bin,
                 tx_frequency_hz - rx_frequency_hz);
-   std::fprintf(stderr,
-                "align: quadrature using TXA-only leakage source; "
-                "weak RXB captures are intentionally not rejected\n");
    std::fflush(stderr);
    bool aligned = false;
 
 
+   AlignmentBinResult probe_result_a{};
+   AlignmentBinResult probe_result_b{};
+   double probe_score_a = 0.0;
+   double probe_score_b = 0.0;
+   LMS7002M::Channel selected_source_channel = LMS7002M::Channel::ChA;
+
    {
-      const uint16_t mac_before_probe = lms->SPI_read(0x0020, true);
+      OpStatus probe_status =
+         configure_quadrature_alignment_tx_source(
+            lms,
+            LMS7002M::Channel::ChA);
+      if(probe_status != OpStatus::Success)
+      {
+         if(register_backup) lms->RestoreRegisterMap(register_backup);
+         lms->SPI_write(0x0020, caller_mac, true);
+         return false;
+      }
 
-      const AlignmentBinResult tx_a_only_probe = MeasureAlignmentBin(quadrature_bin);
+      probe_result_a = MeasureAlignmentBin(quadrature_bin);
+      if(probe_result_a.valid)
+         probe_score_a = quadrature_probe_score(probe_result_a);
 
-      lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_A, 0, true);
-      lms->Modify_SPI_Reg_bits(LMS7002MCSR::TXEN_B, 1, true);
-      lms->SetActiveChannel(LMS7002M::Channel::ChB);
-      lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 1, true);
-      lms->Modify_SPI_Reg_bits(LMS7002MCSR::INSEL_TXTSP, 1, true);
-      lms->LoadDC_REG_IQ(TRXDir::Tx, 0x3FFF, 0x3FFF);
-      lms->SetActiveChannel(LMS7002M::Channel::ChA);
-      lms->Modify_SPI_Reg_bits(LMS7002MCSR::EN_TXTSP, 0, true);
-      lms->LoadDC_REG_IQ(TRXDir::Tx, 0, 0);
-      lms->SetActiveChannel(LMS7002M::Channel::ChA);
+      probe_status =
+         configure_quadrature_alignment_tx_source(
+            lms,
+            LMS7002M::Channel::ChB);
+      if(probe_status != OpStatus::Success)
+      {
+         if(register_backup) lms->RestoreRegisterMap(register_backup);
+         lms->SPI_write(0x0020, caller_mac, true);
+         return false;
+      }
 
-      const AlignmentBinResult tx_b_only_probe = MeasureAlignmentBin(quadrature_bin);
+      probe_result_b = MeasureAlignmentBin(quadrature_bin);
+      if(probe_result_b.valid)
+         probe_score_b = quadrature_probe_score(probe_result_b);
+
+      if((!probe_result_a.valid) && (!probe_result_b.valid))
+      {
+         lime::warning("align: quadrature source probing failed on both channels");
+         if(register_backup) lms->RestoreRegisterMap(register_backup);
+         lms->SPI_write(0x0020, caller_mac, true);
+         return false;
+      }
+
+      if(probe_result_a.valid && (!probe_result_b.valid))
+         selected_source_channel = LMS7002M::Channel::ChA;
+      else if((!probe_result_a.valid) && probe_result_b.valid)
+         selected_source_channel = LMS7002M::Channel::ChB;
+      else if(probe_score_b > probe_score_a)
+         selected_source_channel = LMS7002M::Channel::ChB;
+      else
+         selected_source_channel = LMS7002M::Channel::ChA;
+
+      probe_status =
+         configure_quadrature_alignment_tx_source(
+            lms,
+            selected_source_channel);
+      if(probe_status != OpStatus::Success)
+      {
+         if(register_backup) lms->RestoreRegisterMap(register_backup);
+         lms->SPI_write(0x0020, caller_mac, true);
+         return false;
+      }
 
       std::fprintf(stderr,
-                   "align: source probe tx_a_only power_a=%.3e power_b=%.3e ; "
-                   "tx_b_only power_a=%.3e power_b=%.3e\n",
-                   tx_a_only_probe.power_a,
-                   tx_a_only_probe.power_b,
-                   tx_b_only_probe.power_a,
-                   tx_b_only_probe.power_b);
+                   "align: source probe tx_a score=%.3e power_a=%.3e power_b=%.3e ; "
+                   "tx_b score=%.3e power_a=%.3e power_b=%.3e\n",
+                   probe_score_a,
+                   probe_result_a.power_a,
+                   probe_result_a.power_b,
+                   probe_score_b,
+                   probe_result_b.power_a,
+                   probe_result_b.power_b);
+      std::fprintf(stderr,
+                   "align: quadrature selected tx source channel=%s score=%.3e\n",
+                   alignment_channel_name(selected_source_channel),
+                   selected_source_channel == LMS7002M::Channel::ChA
+                      ? probe_score_a
+                      : probe_score_b);
       std::fflush(stderr);
-
-      lms->SPI_write(0x0020, mac_before_probe, true);
-      configure_quadrature_alignment_single_tx_source(lms);
    }
 
 
@@ -923,10 +988,7 @@ TRXLooper::AlignQuadratureRobust(double accept_abs_mean_phase_deg)
          ResetRxIQGeneratorAlignmentState();
          continue;
       }
-      /*
-       * Do not add a minimum-power gate on channel B here.
-       * In this mode RXB may only see TXA leakage and still carries usable phase.
-       */
+
       const double absolute_phase_degrees = std::fabs(result.phase_degrees);
       std::fprintf(stderr,
                    "align: quadrature iter=%u abs_phase_deg=%.6f "
@@ -1343,7 +1405,7 @@ bool TRXLooper::CaptureFreshAlignmentSamples(
 
 AlignmentBinResult TRXLooper::MeasureAlignmentBin(int bin)
 {
-    AlignmentBinResult result;
+    AlignmentBinResult result{};
     result.bin = bin;
     result.valid = false;
 
