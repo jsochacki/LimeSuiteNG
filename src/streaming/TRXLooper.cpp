@@ -640,16 +640,63 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
 {
     static constexpr double k_alignment_slope_power_keep_within_db = 12.0;
     static constexpr std::size_t k_alignment_slope_min_valid_bins = 4;
-    static const double legacy_offsets[] = { 1.15 / 60.0, 1.10 / 40.0, 0.55 / 20.0, 0.20 / 10.0, 0.18 / 5.0 };
-    static const double legacy_tolerances[] = { 0.90, 0.45, 0.25, 0.14, 0.06 };
+
+    /*
+     * Original legacy table retained for reference.
+     * This is the historical model that expected a specific signed slope.
+     */
+    static const double legacy_offsets[] =
+    {
+        1.15 / 60.0,
+        1.10 / 40.0,
+        0.55 / 20.0,
+        0.20 / 10.0,
+        0.18 / 5.0
+    };
+
+    /*
+     * Active experimental table.
+     * Seeded with the current legacy values for now.
+     * You can tune these independently over time.
+     */
+    static const double experimental_offsets[] =
+    {
+        1.15 / 60.0,
+        1.10 / 40.0,
+        0.55 / 20.0,
+        0.20 / 10.0,
+        0.18 / 5.0
+    };
+
+    static const double legacy_tolerances[] =
+    {
+        0.90,
+        0.45,
+        0.25,
+        0.14,
+        0.06
+    };
 
     if (decimation_index < 0 || decimation_index > 4)
         decimation_index = 0;
 
-    const double expected_phase_difference_deg = legacy_offsets[decimation_index] * sample_rate_hz / 1.0e6;
-    const double expected_slope_deg_per_bin = -expected_phase_difference_deg / 32.0;
-    const double slope_tolerance_deg_per_bin = legacy_tolerances[decimation_index] / 32.0;
-    const double residual_rms_tolerance_deg = std::max(2.0, legacy_tolerances[decimation_index] * 8.0);
+    const double legacy_expected_phase_difference_deg =
+        legacy_offsets[decimation_index] * sample_rate_hz / 1.0e6;
+
+    const double legacy_expected_slope_deg_per_bin =
+        -legacy_expected_phase_difference_deg / 32.0;
+
+    const double experimental_target_phase_difference_deg =
+        experimental_offsets[decimation_index] * sample_rate_hz / 1.0e6;
+
+    const double experimental_target_slope_deg_per_bin =
+        -experimental_target_phase_difference_deg / 32.0;
+
+    const double experimental_target_abs_slope_deg_per_bin =
+        std::fabs(experimental_target_slope_deg_per_bin);
+
+    const double residual_rms_tolerance_deg =
+        std::max(2.0, legacy_tolerances[decimation_index] * 8.0);
 
     for (uint32_t iteration = 0; iteration < k_alignment_slope_max_iterations; ++iteration)
     {
@@ -661,19 +708,24 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
 
         std::vector<AlignmentBinResult> measured_bins;
         measured_bins.reserve(bins.size());
+
         for (int bin : bins)
         {
             const double tx_frequency_hz =
                 450.0e6 + sample_rate_hz * static_cast<double>(bin) / 512.0;
+
             lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
+
             const AlignmentBinResult result = MeasureAlignmentBin(bin);
             if (!result.valid)
             {
                 measured_bins.clear();
                 break;
             }
+
             measured_bins.push_back(result);
         }
+
         if (measured_bins.empty())
             continue;
 
@@ -681,11 +733,13 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
             filter_alignment_bins_by_relative_power(
                 measured_bins,
                 k_alignment_slope_power_keep_within_db);
+
         if (filtered_bins.size() < k_alignment_slope_min_valid_bins)
             continue;
 
         std::vector<int> filtered_bin_indices;
         std::vector<double> filtered_phase_degrees;
+
         for (const AlignmentBinResult& result : filtered_bins)
         {
             filtered_bin_indices.push_back(result.bin);
@@ -698,6 +752,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         double fitted_slope_deg_per_bin = 0.0;
         double fitted_intercept_deg = 0.0;
         double fitted_rms_error_deg = 0.0;
+
         if (!linear_fit_phase_vs_bin(
                 filtered_bin_indices,
                 unwrapped_phase_degrees,
@@ -708,16 +763,23 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
             continue;
         }
 
-        const double slope_error_deg_per_bin =
-            std::fabs(fitted_slope_deg_per_bin - expected_slope_deg_per_bin);
+        const double fitted_abs_slope_deg_per_bin =
+            std::fabs(fitted_slope_deg_per_bin);
 
         std::fprintf(
             stderr,
-            "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f phases_deg=",
+            "align: slope iter=%u "
+            "fitted_slope_deg_per_bin=%+.9f "
+            "fitted_abs_slope_deg_per_bin=%.9f "
+            "legacy_expected_slope_deg_per_bin=%+.9f "
+            "experimental_target_abs_slope_deg_per_bin=%.9f "
+            "rms_error_deg=%.6f "
+            "phases_deg=",
             iteration,
             fitted_slope_deg_per_bin,
-            expected_slope_deg_per_bin,
-            slope_error_deg_per_bin,
+            fitted_abs_slope_deg_per_bin,
+            legacy_expected_slope_deg_per_bin,
+            experimental_target_abs_slope_deg_per_bin,
             fitted_rms_error_deg);
 
         for (std::size_t phase_index = 0; phase_index < filtered_bin_indices.size(); ++phase_index)
@@ -733,11 +795,10 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         std::fprintf(stderr, "\n");
         std::fflush(stderr);
 
-        if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) &&
+        if ((fitted_abs_slope_deg_per_bin <= experimental_target_abs_slope_deg_per_bin) &&
             (fitted_rms_error_deg <= residual_rms_tolerance_deg))
         {
-            std::fprintf(stderr, "align: slope search accepted on iteration %u", iteration);
-            std::fprintf(stderr, "\n");
+            std::fprintf(stderr, "align: slope search accepted on iteration %u\n", iteration);
             std::fflush(stderr);
             return true;
         }
