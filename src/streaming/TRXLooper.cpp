@@ -940,15 +940,38 @@ OpStatus TRXLooper::FlushTransportStateForAlignment(void)
         const bool same_dma_object =
             (mRxArgs.dma.get() == mTxArgs.dma.get());
 
-        const std::string rx_dma_name = mRxArgs.dma->GetName();
-        const std::string tx_dma_name = mTxArgs.dma->GetName();
-
         const bool same_dma_name =
-            (!rx_dma_name.empty()) &&
-            (!tx_dma_name.empty()) &&
-            (rx_dma_name == tx_dma_name);
+            (mRxArgs.dma->GetName() == mTxArgs.dma->GetName());
 
         tx_dma_shares_rx_transport = same_dma_object || same_dma_name;
+    }
+
+    /*
+     * This one must always happen.
+     *
+     * The alignment capture helpers immediately call mRxArgs.dma->Enable(true)
+     * after this flush returns, so Rx must be torn down here first or the
+     * LimeSDR-USB path can fail trying to re-enable an already-enabled DMA.
+     */
+    if (mRxArgs.dma)
+    {
+        status = mRxArgs.dma->Enable(false);
+        if (status != OpStatus::Success)
+            return status;
+    }
+
+    /*
+     * Only disable Tx if it is actually independent.
+     *
+     * If Tx shares the same transport as Rx, the Rx disable above has already
+     * shut the shared transport down once, and a second Tx-side disable is
+     * redundant at best and disruptive at worst.
+     */
+    if (mTxArgs.dma && !tx_dma_shares_rx_transport)
+    {
+        status = mTxArgs.dma->Enable(false);
+        if (status != OpStatus::Success)
+            return status;
     }
 
     if (mRxArgs.dma)
@@ -957,6 +980,11 @@ OpStatus TRXLooper::FlushTransportStateForAlignment(void)
             mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
     }
 
+    /*
+     * Same rule as above: only reset Tx-side ownership if Tx really uses an
+     * independent transport. For a shared transport, alignment is about to use
+     * the Rx path only, so do not perturb the shared transport twice.
+     */
     if (mTxArgs.dma && !tx_dma_shares_rx_transport)
     {
         for (uint16_t buffer_index = 0; buffer_index < mTxArgs.buffers.size(); ++buffer_index)
