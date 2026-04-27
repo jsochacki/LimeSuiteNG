@@ -710,7 +710,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
                 unwrapped_phase_degrees[phase_index]);
         }
 
-        std::fprintf(stderr, "");
+        std::fprintf(stderr, "\n");
         std::fflush(stderr);
 
         if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) &&
