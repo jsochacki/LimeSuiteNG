@@ -173,9 +173,8 @@ double mean_absolute_value(const std::vector<double>& values)
     return absolute_sum / static_cast<double>(values.size());
 }
 
-
 static uint32_t
-get_alignment_payload_bytes_from_captured_size(
+get_alignment_payload_bytes_to_deinterleave(
     const FPGA_RxDataPacket& packet,
     uint32_t                 captured_total_bytes)
 {
@@ -190,10 +189,13 @@ get_alignment_payload_bytes_from_captured_size(
             captured_total_bytes - header_bytes,
             static_cast<uint32_t>(sizeof(packet.data)));
 
-    return copied_payload_bytes;
+    const uint32_t claimed_payload_bytes =
+        packet.GetPayloadSize() == 0
+            ? copied_payload_bytes
+            : static_cast<uint32_t>(packet.GetPayloadSize());
+
+    return std::min<uint32_t>(claimed_payload_bytes, copied_payload_bytes);
 }
-
-
 
 bool deinterleave_alignment_packet(
     const StreamConfig&       config,
@@ -215,18 +217,13 @@ bool deinterleave_alignment_packet(
     conversion.channelCount = 2;
 
     const uint32_t payload_size_bytes =
-    get_alignment_payload_bytes_from_captured_size(packet, captured_total_bytes);
-    const int samples_deinterleaved = Deinterleave(destinations, packet.data, payload_size_bytes, conversion);
+        get_alignment_payload_bytes_to_deinterleave(packet, captured_total_bytes);
 
-    //512 sized packet but header is 16 bits so only 510 samples
+    const int samples_deinterleaved =
+        Deinterleave(destinations, packet.data, payload_size_bytes, conversion);
+
     if (samples_deinterleaved < 32)
-    {
-       std::fprintf(stderr, "align: samples_deinterleaved=%d payload_bytes=%u\n",
-           samples_deinterleaved,
-           payload_size_bytes);
-       std::fflush(stderr);
         return false;
-    }
 
     channel_a_samples->resize(samples_deinterleaved);
     channel_b_samples->resize(samples_deinterleaved);
