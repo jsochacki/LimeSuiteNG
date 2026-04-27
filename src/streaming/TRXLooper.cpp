@@ -51,26 +51,44 @@ static_assert(sizeof(FPGA_RxDataPacket) == 4096, "unexpected FPGA_RxDataPacket s
 
 namespace {
 
-std::vector<double> unwrap_phase_degrees(const std::vector<double>& wrapped_phase_degrees)
+	static double
+fold_phase_degrees_mod_180(double phase_degrees)
+{
+    while (phase_degrees >= 90.0)
+        phase_degrees -= 180.0;
+
+    while (phase_degrees < -90.0)
+        phase_degrees += 180.0;
+
+    return phase_degrees;
+}
+
+static std::vector<double>
+unwrap_phase_degrees_mod_180(const std::vector<double>& wrapped_phase_degrees)
 {
     std::vector<double> unwrapped_phase_degrees = wrapped_phase_degrees;
     if (unwrapped_phase_degrees.empty())
         return unwrapped_phase_degrees;
 
+    unwrapped_phase_degrees[0] =
+        fold_phase_degrees_mod_180(unwrapped_phase_degrees[0]);
+
     for (std::size_t index = 1; index < unwrapped_phase_degrees.size(); ++index)
     {
-        double phase_delta_degrees = unwrapped_phase_degrees[index] - unwrapped_phase_degrees[index - 1];
-        while (phase_delta_degrees > 180.0)
-        {
-            unwrapped_phase_degrees[index] -= 360.0;
-            phase_delta_degrees -= 360.0;
-        }
-        while (phase_delta_degrees < -180.0)
-        {
-            unwrapped_phase_degrees[index] += 360.0;
-            phase_delta_degrees += 360.0;
-        }
+        double phase_value =
+            fold_phase_degrees_mod_180(unwrapped_phase_degrees[index]);
+
+        const double previous_value = unwrapped_phase_degrees[index - 1];
+
+        while ((phase_value - previous_value) > 90.0)
+            phase_value -= 180.0;
+
+        while ((phase_value - previous_value) < -90.0)
+            phase_value += 180.0;
+
+        unwrapped_phase_degrees[index] = phase_value;
     }
+
     return unwrapped_phase_degrees;
 }
 
@@ -132,8 +150,32 @@ double mean_absolute_value(const std::vector<double>& values)
     return absolute_sum / static_cast<double>(values.size());
 }
 
-bool deinterleave_alignment_packet(const StreamConfig& config,
+
+static uint32_t
+get_alignment_payload_bytes_from_captured_size(
     const FPGA_RxDataPacket& packet,
+    uint32_t                 captured_total_bytes)
+{
+    const uint32_t header_bytes =
+        static_cast<uint32_t>(offsetof(FPGA_RxDataPacket, data));
+
+    if (captured_total_bytes <= header_bytes)
+        return 0;
+
+    const uint32_t copied_payload_bytes =
+        std::min<uint32_t>(
+            captured_total_bytes - header_bytes,
+            static_cast<uint32_t>(sizeof(packet.data)));
+
+    return copied_payload_bytes;
+}
+
+
+
+bool deinterleave_alignment_packet(
+    const StreamConfig&       config,
+    const FPGA_RxDataPacket&  packet,
+    uint32_t                  captured_total_bytes,
     std::vector<complex16_t>* channel_a_samples,
     std::vector<complex16_t>* channel_b_samples)
 {
@@ -149,7 +191,8 @@ bool deinterleave_alignment_packet(const StreamConfig& config,
     conversion.destFormat = DataFormat::I16;
     conversion.channelCount = 2;
 
-    const uint16_t payload_size_bytes = packet.GetPayloadSize() == 0 ? sizeof(packet.data) : packet.GetPayloadSize();
+    const uint32_t payload_size_bytes =
+    get_alignment_payload_bytes_from_captured_size(packet, captured_total_bytes);
     const int samples_deinterleaved = Deinterleave(destinations, packet.data, payload_size_bytes, conversion);
 
     //512 sized packet but header is 16 bits so only 510 samples
@@ -519,10 +562,10 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
         }
 
         FPGA_RxDataPacket packet;
-        const bool        have_packet
-           = CaptureFreshAlignmentPacket(&packet,
-                                         std::chrono::milliseconds(150));
-        if(!have_packet) continue;
+        const bool have_packet =
+            CaptureFreshAlignmentPacket(&packet, std::chrono::milliseconds(150));
+        if (!have_packet)
+            continue;
 
         if (CheckTSPAligned(packet, checkpoint_pairs))
         {
@@ -552,13 +595,16 @@ bool TRXLooper::AlignRxTSPRobust(uint32_t checkpoint_pairs)
 
 bool TRXLooper::CheckTSPAligned(const FPGA_RxDataPacket& packet, uint32_t checkpoint_pairs) const
 {
-    const uint16_t payload_size_bytes = packet.GetPayloadSize() == 0 ? sizeof(packet.data) : packet.GetPayloadSize();
+    const uint16_t payload_size_bytes =
+        packet.GetPayloadSize() == 0 ? sizeof(packet.data) : packet.GetPayloadSize();
     const uint32_t payload_word_count = payload_size_bytes / sizeof(uint32_t);
     const uint32_t required_word_count = checkpoint_pairs * 2;
     if (payload_word_count < required_word_count)
         return false;
 
-    const uint32_t* payload_words = reinterpret_cast<const uint32_t*>(packet.data);
+    const uint32_t* payload_words =
+        reinterpret_cast<const uint32_t*>(packet.data);
+
     for (uint32_t pair_index = 0; pair_index < checkpoint_pairs; ++pair_index)
     {
         const uint32_t left_word = payload_words[2 * pair_index + 0];
@@ -593,79 +639,86 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         if (!AlignRxTSPRobust(k_alignment_tsp_checkpoint_pairs))
             continue;
 
-
         std::vector<AlignmentBinResult> measured_bins;
         measured_bins.reserve(bins.size());
-        for(int bin : bins)
+        for (int bin : bins)
         {
-           const double tx_frequency_hz
-              = 450.0e6 + sample_rate_hz * static_cast<double>(bin) / 512.0;
-           lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
-           const AlignmentBinResult result = MeasureAlignmentBin(bin);
-           if(!result.valid)
-           {
-              measured_bins.clear();
-              break;
-           }
-           measured_bins.push_back(result);
+            const double tx_frequency_hz =
+                450.0e6 + sample_rate_hz * static_cast<double>(bin) / 512.0;
+            lms->SetFrequencySX(TRXDir::Tx, tx_frequency_hz);
+            const AlignmentBinResult result = MeasureAlignmentBin(bin);
+            if (!result.valid)
+            {
+                measured_bins.clear();
+                break;
+            }
+            measured_bins.push_back(result);
         }
-        if(measured_bins.empty()) continue;
-        const std::vector<AlignmentBinResult> filtered_bins
-           = filter_alignment_bins_by_relative_power(
-              measured_bins,
-              k_alignment_slope_power_keep_within_db);
-        if(filtered_bins.size() < k_alignment_slope_min_valid_bins) continue;
-        std::vector<int>    filtered_bin_indices;
+        if (measured_bins.empty())
+            continue;
+
+        const std::vector<AlignmentBinResult> filtered_bins =
+            filter_alignment_bins_by_relative_power(
+                measured_bins,
+                k_alignment_slope_power_keep_within_db);
+        if (filtered_bins.size() < k_alignment_slope_min_valid_bins)
+            continue;
+
+        std::vector<int> filtered_bin_indices;
         std::vector<double> filtered_phase_degrees;
-        for(const AlignmentBinResult& result : filtered_bins)
+        for (const AlignmentBinResult& result : filtered_bins)
         {
-           filtered_bin_indices.push_back(result.bin);
-           filtered_phase_degrees.push_back(result.phase_degrees);
-        }
-        const std::vector<double> unwrapped_phase_degrees
-           = unwrap_phase_degrees(filtered_phase_degrees);
-        double fitted_slope_deg_per_bin = 0.0;
-        double fitted_intercept_deg     = 0.0;
-        double fitted_rms_error_deg     = 0.0;
-        if(!linear_fit_phase_vs_bin(filtered_bin_indices,
-                                    unwrapped_phase_degrees,
-                                    &fitted_slope_deg_per_bin,
-                                    &fitted_intercept_deg,
-                                    &fitted_rms_error_deg))
-        {
-           continue;
+            filtered_bin_indices.push_back(result.bin);
+            filtered_phase_degrees.push_back(result.phase_degrees);
         }
 
+        const std::vector<double> unwrapped_phase_degrees =
+            unwrap_phase_degrees_mod_180(filtered_phase_degrees);
+
+        double fitted_slope_deg_per_bin = 0.0;
+        double fitted_intercept_deg = 0.0;
+        double fitted_rms_error_deg = 0.0;
+        if (!linear_fit_phase_vs_bin(
+                filtered_bin_indices,
+                unwrapped_phase_degrees,
+                &fitted_slope_deg_per_bin,
+                &fitted_intercept_deg,
+                &fitted_rms_error_deg))
+        {
+            continue;
+        }
 
         const double slope_error_deg_per_bin =
             std::fabs(fitted_slope_deg_per_bin - expected_slope_deg_per_bin);
 
-         std::fprintf(
-             stderr,
-             "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f phases_deg=",
-             iteration,
-             fitted_slope_deg_per_bin,
-             expected_slope_deg_per_bin,
-             slope_error_deg_per_bin,
-             fitted_rms_error_deg);
+        std::fprintf(
+            stderr,
+            "align: slope iter=%u fitted_slope_deg_per_bin=%+.9f expected_slope_deg_per_bin=%+.9f slope_error_deg_per_bin=%.9f rms_error_deg=%.6f phases_deg=",
+            iteration,
+            fitted_slope_deg_per_bin,
+            expected_slope_deg_per_bin,
+            slope_error_deg_per_bin,
+            fitted_rms_error_deg);
 
-         for (std::size_t phase_index = 0; phase_index < filtered_bin_indices.size(); ++phase_index)
-         {
-             std::fprintf(
-                 stderr,
-                 "%s%d:%+.6f",
-                 phase_index == 0 ? "" : ",",
-                 filtered_bin_indices[phase_index],
-                 unwrapped_phase_degrees[phase_index]);
-         }
+        for (std::size_t phase_index = 0; phase_index < filtered_bin_indices.size(); ++phase_index)
+        {
+            std::fprintf(
+                stderr,
+                "%s%d:%+.6f",
+                phase_index == 0 ? "" : ",",
+                filtered_bin_indices[phase_index],
+                unwrapped_phase_degrees[phase_index]);
+        }
 
-         std::fprintf(stderr, "\n");
-         std::fflush(stderr);
+        std::fprintf(stderr, "
+");
+        std::fflush(stderr);
 
         if ((slope_error_deg_per_bin <= slope_tolerance_deg_per_bin) &&
             (fitted_rms_error_deg <= residual_rms_tolerance_deg))
         {
-            std::fprintf(stderr, "align: slope search accepted on iteration %u\n", iteration);
+            std::fprintf(stderr, "align: slope search accepted on iteration %u
+", iteration);
             std::fflush(stderr);
             return true;
         }
@@ -882,18 +935,22 @@ OpStatus TRXLooper::FlushTransportStateForAlignment(void)
     fpga->StopWaveformPlayback();
     fpga->StopStreaming();
 
-    if (mRxArgs.dma)
-    {
-        status = mRxArgs.dma->Enable(false);
-        if (status != OpStatus::Success)
-            return status;
-    }
+    bool tx_dma_shares_rx_transport = false;
 
-    if (mTxArgs.dma)
+    if (mRxArgs.dma && mTxArgs.dma)
     {
-        status = mTxArgs.dma->Enable(false);
-        if (status != OpStatus::Success)
-            return status;
+        const bool same_dma_object =
+            (mRxArgs.dma.get() == mTxArgs.dma.get());
+
+        const std::string rx_dma_name = mRxArgs.dma->GetName();
+        const std::string tx_dma_name = mTxArgs.dma->GetName();
+
+        const bool same_dma_name =
+            (!rx_dma_name.empty()) &&
+            (!tx_dma_name.empty()) &&
+            (rx_dma_name == tx_dma_name);
+
+        tx_dma_shares_rx_transport = same_dma_object || same_dma_name;
     }
 
     if (mRxArgs.dma)
@@ -902,7 +959,7 @@ OpStatus TRXLooper::FlushTransportStateForAlignment(void)
             mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
     }
 
-    if (mTxArgs.dma)
+    if (mTxArgs.dma && !tx_dma_shares_rx_transport)
     {
         for (uint16_t buffer_index = 0; buffer_index < mTxArgs.buffers.size(); ++buffer_index)
             mTxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
@@ -962,6 +1019,7 @@ void TRXLooper::RecycleStreamPacketsForAlignment(Stream& stream_state)
     }
 }
 
+
 bool TRXLooper::CaptureFreshAlignmentPacket(
     FPGA_RxDataPacket* packet,
     std::chrono::milliseconds timeout)
@@ -1005,13 +1063,12 @@ bool TRXLooper::CaptureFreshAlignmentPacket(
         return false;
     }
 
-    fpga->StartStreaming();
-
-    //std::fprintf(
-    //    stderr,
-    //    "align: capture baseline completed=%" PRIu64 "\n",
-    //    baseline_completed);
-    //std::fflush(stderr);
+    status = fpga->StartStreaming();
+    if (status != OpStatus::Success)
+    {
+        mRxArgs.dma->Enable(false);
+        return false;
+    }
 
     const auto start_time = std::chrono::steady_clock::now();
 
@@ -1021,18 +1078,11 @@ bool TRXLooper::CaptureFreshAlignmentPacket(
 
         if (state.transfersCompleted > baseline_completed)
         {
-            //std::fprintf(
-            //    stderr,
-            //    "align: capture got completion completed=%" PRIu64 " buffer_index=%u\n",
-            //    state.transfersCompleted,
-            //    static_cast<unsigned>(buffer_index));
-            //std::fflush(stderr);
-
             mRxArgs.dma->BufferOwnership(
                 buffer_index,
                 DataTransferDirection::DeviceToHost);
 
-            std::memset(packet, 0, sizeof(FPGA_RxDataPacket));
+            *packet = FPGA_RxDataPacket{};
             std::memcpy(
                 packet,
                 mRxArgs.buffers.at(buffer_index),
@@ -1049,9 +1099,6 @@ bool TRXLooper::CaptureFreshAlignmentPacket(
 
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
-
-    std::fprintf(stderr, "align: capture timeout no completion\n");
-    std::fflush(stderr);
 
     fpga->StopStreaming();
     mRxArgs.dma->Enable(false);
@@ -1101,7 +1148,6 @@ bool TRXLooper::CaptureFreshAlignmentSamples(
 
     bool success_flag = false;
 
-    // Continue capturing packets until the vector size reaches the required threshold
     while (static_cast<int>(channel_a_samples->size()) < required_sample_count)
     {
         mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
@@ -1110,9 +1156,9 @@ bool TRXLooper::CaptureFreshAlignmentSamples(
         const uint64_t baseline_completed = baseline_state.transfersCompleted;
 
         status = mRxArgs.dma->SubmitRequest(
-            buffer_index, 
-            mRxArgs.packetSize, 
-            DataTransferDirection::DeviceToHost, 
+            buffer_index,
+            mRxArgs.packetSize,
+            DataTransferDirection::DeviceToHost,
             true);
 
         if (status != OpStatus::Success)
@@ -1133,17 +1179,17 @@ bool TRXLooper::CaptureFreshAlignmentSamples(
                 std::vector<complex16_t> temporary_channel_b;
 
                 mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::DeviceToHost);
-                
+
                 std::memset(&hardware_packet, 0, sizeof(FPGA_RxDataPacket));
                 std::memcpy(&hardware_packet, mRxArgs.buffers.at(buffer_index), mRxArgs.packetSize);
-                
+
                 mRxArgs.dma->BufferOwnership(buffer_index, DataTransferDirection::HostToDevice);
 
-                // Deinterleave the single packet and append to the aggregate vectors
                 if (!deinterleave_alignment_packet(
-                        mConfig, 
-                        hardware_packet, 
-                        &temporary_channel_a, 
+                        mConfig,
+                        hardware_packet,
+                        mRxArgs.packetSize,
+                        &temporary_channel_a,
                         &temporary_channel_b))
                 {
                     packet_received = false;
@@ -1151,13 +1197,13 @@ bool TRXLooper::CaptureFreshAlignmentSamples(
                 }
 
                 channel_a_samples->insert(
-                    channel_a_samples->end(), 
-                    temporary_channel_a.begin(), 
+                    channel_a_samples->end(),
+                    temporary_channel_a.begin(),
                     temporary_channel_a.end());
 
                 channel_b_samples->insert(
-                    channel_b_samples->end(), 
-                    temporary_channel_b.begin(), 
+                    channel_b_samples->end(),
+                    temporary_channel_b.begin(),
                     temporary_channel_b.end());
 
                 packet_received = true;
@@ -1182,7 +1228,6 @@ bool TRXLooper::CaptureFreshAlignmentSamples(
 
     if (success_flag)
     {
-        // Truncate to exact required count to maintain DFT alignment if necessary
         channel_a_samples->resize(required_sample_count);
         channel_b_samples->resize(required_sample_count);
     }
@@ -1199,12 +1244,11 @@ AlignmentBinResult TRXLooper::MeasureAlignmentBin(int bin)
     std::vector<complex16_t> channel_a_samples;
     std::vector<complex16_t> channel_b_samples;
 
-    // Aggregating 256 samples (approx 8 packets at 32 samples/packet)
     const int required_sample_count = 256;
     const bool have_samples = CaptureFreshAlignmentSamples(
-        &channel_a_samples, 
-        &channel_b_samples, 
-        required_sample_count, 
+        &channel_a_samples,
+        &channel_b_samples,
+        required_sample_count,
         std::chrono::milliseconds(150));
 
     if (!have_samples)
@@ -1220,15 +1264,14 @@ AlignmentBinResult TRXLooper::MeasureAlignmentBin(int bin)
     complex64f_t spectrum_a(0.0, 0.0);
     complex64f_t spectrum_b(0.0, 0.0);
 
-    // Phasor: exp(-j * 2 * pi * k * n / N)
     for (int sample_index = 0; sample_index < sample_count; ++sample_index)
     {
         const complex64f_t sample_a(
-            static_cast<double>(channel_a_samples[sample_index].real()), 
+            static_cast<double>(channel_a_samples[sample_index].real()),
             static_cast<double>(channel_a_samples[sample_index].imag()));
 
         const complex64f_t sample_b(
-            static_cast<double>(channel_b_samples[sample_index].real()), 
+            static_cast<double>(channel_b_samples[sample_index].real()),
             static_cast<double>(channel_b_samples[sample_index].imag()));
 
         const double angle = (-2.0 * pi_constant * static_cast<double>(bin) * static_cast<double>(sample_index)) / static_cast<double>(dft_length);
@@ -1241,10 +1284,8 @@ AlignmentBinResult TRXLooper::MeasureAlignmentBin(int bin)
     result.power_a = compute_single_bin_power(channel_a_samples, bin, sample_count, dft_length);
     result.power_b = compute_single_bin_power(channel_b_samples, bin, sample_count, dft_length);
 
-    // Calculate phase difference between channels
     result.phase_degrees = (std::arg(spectrum_b) - std::arg(spectrum_a)) * 180.0 / pi_constant;
 
-    // Wrap to [-180, 180]
     while (result.phase_degrees < -180.0) result.phase_degrees += 360.0;
     while (result.phase_degrees > 180.0) result.phase_degrees -= 360.0;
 
