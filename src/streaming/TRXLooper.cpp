@@ -747,7 +747,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         }
 
         const std::vector<double> unwrapped_phase_degrees =
-            unwrap_phase_degrees(filtered_phase_degrees);
+            unwrap_phase_degrees_mod_180(filtered_phase_degrees);
 
         double fitted_slope_deg_per_bin = 0.0;
         double fitted_intercept_deg = 0.0;
