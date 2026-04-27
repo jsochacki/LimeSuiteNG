@@ -51,7 +51,30 @@ static_assert(sizeof(FPGA_RxDataPacket) == 4096, "unexpected FPGA_RxDataPacket s
 
 namespace {
 
-	static double
+std::vector<double> unwrap_phase_degrees(const std::vector<double>& wrapped_phase_degrees)
+{
+    std::vector<double> unwrapped_phase_degrees = wrapped_phase_degrees;
+    if (unwrapped_phase_degrees.empty())
+        return unwrapped_phase_degrees;
+
+    for (std::size_t index = 1; index < unwrapped_phase_degrees.size(); ++index)
+    {
+        double phase_delta_degrees = unwrapped_phase_degrees[index] - unwrapped_phase_degrees[index - 1];
+        while (phase_delta_degrees > 180.0)
+        {
+            unwrapped_phase_degrees[index] -= 360.0;
+            phase_delta_degrees -= 360.0;
+        }
+        while (phase_delta_degrees < -180.0)
+        {
+            unwrapped_phase_degrees[index] += 360.0;
+            phase_delta_degrees += 360.0;
+        }
+    }
+    return unwrapped_phase_degrees;
+}
+
+static double
 fold_phase_degrees_mod_180(double phase_degrees)
 {
     while (phase_degrees >= 90.0)
@@ -673,7 +696,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         }
 
         const std::vector<double> unwrapped_phase_degrees =
-            unwrap_phase_degrees_mod_180(filtered_phase_degrees);
+            unwrap_phase_degrees(filtered_phase_degrees);
 
         double fitted_slope_deg_per_bin = 0.0;
         double fitted_intercept_deg = 0.0;
@@ -717,6 +740,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
             (fitted_rms_error_deg <= residual_rms_tolerance_deg))
         {
             std::fprintf(stderr, "align: slope search accepted on iteration %u", iteration);
+            std::fprintf(stderr, "\n");
             std::fflush(stderr);
             return true;
         }
