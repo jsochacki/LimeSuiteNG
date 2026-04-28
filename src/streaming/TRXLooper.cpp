@@ -661,11 +661,11 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
      */
     static const double experimental_offsets[] =
     {
-        1.15 / 60.0,
-        1.10 / 40.0,
-        0.55 / 20.0,
-        0.20 / 10.0,
-        0.18 / 5.0
+        1.15 / 120.0,
+        1.10 / 80.0,
+        0.55 / 40.0,
+        0.20 / 20.0,
+        0.18 / 10.0
     };
 
     static const double legacy_tolerances[] =
@@ -675,6 +675,15 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         0.25,
         0.14,
         0.06
+    };
+ 
+    static const double experimental_tolerances[] =
+    {
+        0.45,
+        0.225,
+        0.125,
+        0.07,
+        0.03
     };
 
     if (decimation_index < 0 || decimation_index > 4)
@@ -696,7 +705,7 @@ bool TRXLooper::SearchRxPhaseSlopeState(double sample_rate_hz, int decimation_in
         std::fabs(experimental_target_slope_deg_per_bin);
 
     const double residual_rms_tolerance_deg =
-        std::max(2.0, legacy_tolerances[decimation_index] * 8.0);
+        std::max(2.0, experimental_tolerances[decimation_index] * 8.0);
 
     for (uint32_t iteration = 0; iteration < k_alignment_slope_max_iterations; ++iteration)
     {
